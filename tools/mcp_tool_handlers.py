@@ -677,7 +677,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
                 server._mark_session_proven()
             image_paths.clear()
-            return _render_call_tool_result(result, server_name, image_paths)
+            rendered = _render_call_tool_result(result, server_name, image_paths)
+            binding_status = _bind_hermes_active_goal(
+                server_name, tool_name, args, kwargs, result
+            )
+            if binding_status is not None:
+                try:
+                    payload = json.loads(rendered)
+                    if not isinstance(payload, dict):
+                        payload = {"result": payload}
+                except (TypeError, ValueError):
+                    payload = {"result": rendered}
+                payload["hermes_goal_binding"] = "bound" if binding_status else "not_recorded"
+                rendered = json.dumps(payload, ensure_ascii=False)
+            return rendered
 
         def _on_failure(exc):
             _core._bump_server_error(server_name)

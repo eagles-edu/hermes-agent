@@ -89,7 +89,10 @@ class HookRegistry:
 
     def __init__(self):
         self._handlers: dict[str, list[Callable]] = {}  # event_type -> handlers
+        self._durable_handlers: dict[str, list[Callable]] = {}
         self._loaded_hooks: list[dict] = []  # metadata for listing
+        self._outbox: CodexLifecycleOutbox | None = None
+        self._durable_drain_lock = asyncio.Lock()
 
     @property
     def loaded_hooks(self) -> list[dict]:
@@ -148,13 +151,79 @@ class HookRegistry:
         """Fire all handlers for an event, discarding return values."""
         await self.emit_collect(event_type, context)
 
+    def queue_durable_event(
+        self, event_type: str, context: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any] | None:
+        """Persist an opted-in Codex lifecycle event before scheduling delivery."""
+        if self._outbox is None or event_type not in self._durable_handlers:
+            return None
+        return self._outbox.enqueue(event_type, context or {})
+
+    async def emit_durable(self, event: dict[str, Any]) -> bool:
+        """Deliver a persisted event and acknowledge only explicit consumer success."""
+        if self._outbox is None:
+            return False
+        event_type = event.get("event_type")
+        handlers = self._durable_handlers.get(event_type, [])
+        if not handlers:
+            return False
+        context = dict(event.get("context") or {})
+        context.update(
+            event_id=event["event_id"],
+            source_id=event["source_id"],
+            source_sequence=event["source_sequence"],
+            occurred_at=event["occurred_at"],
+            project_id=event["project_id"],
+            goal_id=event["goal_id"],
+        )
+        acknowledged = True
+        matched_consumer = False
+        for handler in handlers:
+            try:
+                result = handler(event_type, context)
+                result = await result if asyncio.iscoroutine(result) else result
+                if result is None:
+                    continue
+                matched_consumer = True
+                if result is not True:
+                    acknowledged = False
+            except Exception as exc:
+                print(
+                    f"[hooks] Durable handler failed for '{event_type}': {type(exc).__name__}",
+                    flush=True,
+                )
+                matched_consumer = True
+                acknowledged = False
+        acknowledged = acknowledged and matched_consumer
+        self._outbox.mark_attempt(event["event_id"], acknowledged=acknowledged)
+        return acknowledged
+
+    async def drain_durable(self) -> None:
+        """Retry pending deliveries in source order after startup or a new event."""
+        if self._outbox is None:
+            return
+        async with self._durable_drain_lock:
+            while True:
+                events = self._outbox.pending()
+                if not events:
+                    return
+                for event in events:
+                    if not await self.emit_durable(event):
+                        return
+                if len(events) < 100:
+                    return
+
     async def emit_collect(self, event_type: str, context: Optional[dict[str, Any]] = None) -> list[Any]:
         """Fire handlers and return their non-None return values in order (decision-style
         hooks, e.g. ``command:<name>`` policies).  A failing handler is logged, not fatal."""
         if context is None:
             context = {}
         results: list[Any] = []
-        for fn in self._resolve_handlers(event_type):
+        handlers = self._resolve_handlers(event_type)
+        if event_type in self._durable_handlers:
+            durable_ids = {id(fn) for fn in self._durable_handlers[event_type]}
+            handlers = [fn for fn in handlers if id(fn) not in durable_ids]
+        for fn in handlers:
             try:
                 result = fn(event_type, context)
                 result = await result if asyncio.iscoroutine(result) else result  # sync or async handlers
@@ -212,6 +281,14 @@ class ProfileHookRegistries:
 
     async def emit(self, event_type: str, context: Optional[dict[str, Any]] = None) -> None:
         await self._active().emit(event_type, context)
+
+    def queue_durable_event(
+        self, event_type: str, context: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any] | None:
+        return self._active().queue_durable_event(event_type, context)
+
+    async def emit_durable(self, event: dict[str, Any]) -> bool:
+        return await self._active().emit_durable(event)
 
     async def emit_collect(self, event_type: str, context: Optional[dict[str, Any]] = None) -> list[Any]:
         return await self._active().emit_collect(event_type, context)

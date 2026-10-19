@@ -904,7 +904,14 @@ class GatewayTurnProgressMixin:
     def _event_callback_sync(self, event_type: str, context: dict) -> None:
         ctx = self._ctx
         try:
-            asyncio.run_coroutine_threadsafe(ctx._hooks_ref.emit(event_type, context), ctx._loop_for_step)
+            durable_event = ctx._hooks_ref.queue_durable_event(event_type, context)
+
+            async def _deliver() -> None:
+                await ctx._hooks_ref.emit(event_type, context)
+                if durable_event is not None:
+                    await ctx._hooks_ref.drain_durable()
+
+            asyncio.run_coroutine_threadsafe(_deliver(), ctx._loop_for_step)
         except Exception as e:
             logger.debug("event_callback hook error: %s", e)
 
