@@ -1,0 +1,15 @@
+name: host-steward
+version: 0.1.0
+description: "Root-account, read-only host disk inventory and reviewable cleanup proposals."
+provides_tools:
+  - host_inventory
+  - host_proposals
+config_schema:
+  targets:
+    type: list
+    default: []
+    description: "Explicit host paths and owner/action/recovery metadata to inventory."
+  max_entries_per_target:
+    type: int
+    default: 20000
+    description: "Maximum directory entries examined per target; capped at 20000."
