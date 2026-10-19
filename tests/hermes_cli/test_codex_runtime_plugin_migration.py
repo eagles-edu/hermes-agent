@@ -468,6 +468,9 @@ class TestSameNameUserMcpTable:
         hermes_cli/main.py stays pinned, and honour ``CODEX_HOME`` like every codex sibling."""
         import json
 
+        # This checkout lives inside ~/.hermes; keep bootstrap from inspecting
+        # the neighboring user's sealed-install manifest during CLI import.
+        monkeypatch.setattr("pm.environments._payload_manifest", lambda _root: None)
         from hermes_cli import main
 
         codex_home = tmp_path / "alt-codex"

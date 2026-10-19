@@ -40,6 +40,9 @@ def _under(home: Path, fn):
 
 def test_max_turns_and_fallback_chain_follow_routed_profile(two_homes, monkeypatch):
     a, b = two_homes
+    # This checkout lives inside ~/.hermes; don't let bootstrap inspect the
+    # neighboring user's sealed-install manifest while importing gateway.run.
+    monkeypatch.setattr("pm.environments._payload_manifest", lambda _root: None)
     from gateway import run as gateway_run
     from gateway.run import GatewayRunner
 
