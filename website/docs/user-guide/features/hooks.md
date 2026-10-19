@@ -55,6 +55,33 @@ events:
 
 The `events` list determines which events trigger your handler. You can subscribe to any combination of events, including wildcards like `command:*`.
 
+For the Codex app-server lifecycle events only, a trusted local consumer can
+opt in to durable delivery:
+
+```yaml
+name: curator-v2
+events:
+  - codex:turn:start
+  - codex:turn:end
+durable_events:
+  - codex:turn:start
+  - codex:turn:end
+```
+
+Hermes writes an allowlisted, content-free event envelope to a SQLite outbox
+under the active profile before dispatch. The handler receives `event_id`,
+`source_id`, `source_sequence`, and `occurred_at` in addition to the bounded
+Codex correlation fields. Delivery is at-least-once: the handler must return
+the literal boolean `True` only after it has durably accepted the exact event;
+`None` means a project-scoped consumer does not own this event, and `False`,
+other values, or exceptions leave it queued for retry on the next event or
+gateway startup. Pending events are replayed in source-sequence order and a
+failed acknowledgement holds later events behind that source sequence.
+Consumers must deduplicate by `event_id`. The outbox does not contain
+prompt/response text, tool data, model/provider, working directory, or exception
+messages. This is profile-local delivery, not proof of profile authentication,
+project/goal binding, or success-criteria verification.
+
 #### handler.py
 
 ```python
@@ -93,6 +120,8 @@ async def handle(event_type: str, context: dict):
 | `agent:start` | Agent begins processing a message | `platform`, `user_id`, `chat_id`, `thread_id` (forum-topic / thread root id; empty when not in a thread), `chat_type` (`"dm"` \| `"group"` \| `"forum"`; empty if unknown), `session_id`, `message` (truncated to 500 chars) |
 | `agent:step` | Each iteration of the tool-calling loop | `platform`, `user_id`, `session_id`, `iteration`, `tool_names` |
 | `agent:end` | Agent finishes processing | same keys as `agent:start`, plus `response` (truncated to 500 chars) |
+| `codex:turn:start` | A Codex app-server turn is about to be dispatched | `session_id`, `attempt_id`, `model`, `provider`, and `cwd` when available |
+| `codex:turn:end` | A Codex app-server turn returned, was interrupted, or failed | start keys, plus `turn_id`, `outcome` (`completed`, `interrupted`, `failed`), and optional `failure_kind` |
 | `reaction:added` | An emoji reaction was added to a message the bot can see (Slack adapter currently). Requires the `reactions:read` scope + the `reaction_added` bot event subscription; the bot must be a member of the channel. | `platform`, `reaction`, `user_id`, `item_user_id`, `item_type`, `channel_id`, `message_ts`, `team_id`, `event_ts`, `raw_event` |
 | `reaction:removed` | An emoji reaction was removed from a message the bot can see. Requires the `reaction_removed` bot event subscription. | same shape as `reaction:added` |
 | `command:*` | Any slash command executed | `platform`, `user_id`, `command`, `args` |
@@ -100,6 +129,13 @@ async def handle(event_type: str, context: dict):
 #### Wildcard Matching
 
 Handlers registered for `command:*` fire for any `command:` event (`command:model`, `command:reset`, etc.). Monitor all slash commands with a single subscription.
+
+Codex lifecycle hook payloads contain only bounded identifiers and runtime metadata; they do
+not include prompts, responses, tool arguments/results, or exception messages. These hooks
+run only for Codex app-server turns. `outcome: completed` describes the model-runtime turn,
+not completion or verification of a project goal. Hooks are loaded per Hermes profile, so a
+profile-specific Curator adapter should still validate its repository binding and backend
+authorization; the hook's `cwd` is a routing hint, not an identity credential.
 
 :::tip Threaded replies
 A handler posting a follow-up message into the same Telegram forum topic should include `message_thread_id=int(thread_id)` when `chat_type == "forum"` and `thread_id` is non-empty.

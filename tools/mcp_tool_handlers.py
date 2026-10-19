@@ -57,6 +57,78 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
     return _core._tool_read_only_hints.get(_resolve_server_key(server_name), {}).get(tool_name) is True
 
 
+def _trusted_hermes_request_meta(server_name: str, kwargs: dict) -> Optional[dict[str, str]]:
+    """Return host-owned profile/session context only for explicitly opted-in MCP servers.
+
+    The values are carried in MCP request metadata, never model-authored tool arguments. This is
+    intentionally opt-in because request metadata is visible to the receiving server. Requiring
+    a local stdio command keeps the context boundary profile-owned; remote URL transports do not
+    receive Hermes identity or session coordinates through this path.
+    """
+    from hermes_cli.mcp_config import _get_mcp_servers
+    from hermes_constants import get_hermes_home, profile_name_for_home
+
+    config = _get_mcp_servers().get(server_name)
+    if not isinstance(config, dict) or config.get("hermes_context") is not True:
+        return None
+    command = config.get("command")
+    if not isinstance(command, str) or not command.strip() or config.get("url"):
+        raise RuntimeError("Hermes context requires an explicitly opted-in stdio MCP server")
+    session_id = kwargs.get("session_id")
+    profile_id = profile_name_for_home(get_hermes_home())
+    if not isinstance(session_id, str) or not session_id or not profile_id:
+        raise RuntimeError("Hermes profile or session context is unavailable")
+    metadata = {"hermes/profile_id": profile_id, "hermes/session_id": session_id}
+    if kwargs.get("hermes_durable_event") is True:
+        metadata["hermes/durable_event"] = True
+    return metadata
+
+
+def _bind_hermes_active_goal(
+    server_name: str, tool_name: str, args: dict, kwargs: dict, result: Any
+) -> Optional[bool]:
+    """Persist a host-owned session binding after an explicit Curator goal activation.
+
+    Binding is enabled only by local stdio servers that opt into Hermes context
+    and declare the repository's configured project ID. Tool arguments can
+    select a goal, but never a Hermes profile or session.
+    """
+    if mcp_field(result, "is_error", "isError", False):
+        return None
+    if tool_name == "goal_start" and args.get("initial_status") != "active":
+        return None
+    if tool_name not in {"goal_start", "goal_activate", "hermes_goal_bind"}:
+        return None
+    from hermes_cli.mcp_config import _get_mcp_servers
+    from hermes_constants import get_hermes_home, profile_name_for_home
+
+    config = _get_mcp_servers().get(server_name)
+    if not isinstance(config, dict) or config.get("hermes_context") is not True:
+        return None
+    project_id = config.get("hermes_project_id")
+    goal_id = args.get("goal_id")
+    session_id = kwargs.get("session_id")
+    profile_id = profile_name_for_home(get_hermes_home())
+    if not all(isinstance(value, str) and value for value in (project_id, goal_id, session_id, profile_id)):
+        return False
+    try:
+        from gateway.codex_outbox import CodexLifecycleOutbox
+
+        outbox = CodexLifecycleOutbox(
+            get_hermes_home() / "curatormd" / "codex-outbox.sqlite3",
+            profile_id=profile_id,
+        )
+        try:
+            return outbox.bind_goal(project_id, session_id, goal_id)
+        finally:
+            outbox.close()
+    except Exception as exc:
+        # The tool's goal transition already succeeded. Do not report it as failed
+        # or invite a duplicate write; surface only a bounded status to the model.
+        logger.warning("Curator goal binding was not recorded (%s)", type(exc).__name__)
+        return False
+
+
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     """Approval gate for write-capable tools on ``trust: untrusted`` servers. None to proceed,
     else a ``tool_error``. Fail-closed: approval-system errors block."""
@@ -379,7 +451,9 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
-async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict):
+async def _call_tool_racing_stdio_death(
+    server, server_name: str, tool_name: str, args: dict, *, meta: Optional[dict[str, str]] = None
+):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
     ``_watch_stdio_children``). Both raise :class:`_StdioChildExited` for the respawn path, which
@@ -393,7 +467,11 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             f"MCP stdio subprocess for '{server_name}' had already exited when the call was dispatched",
             in_flight=False,
         )
-    _call_coro = server.session.call_tool(tool_name, arguments=args)
+    _call_coro = (
+        server.session.call_tool(tool_name, arguments=args)
+        if meta is None
+        else server.session.call_tool(tool_name, arguments=args, meta=meta)
+    )
     _watch_children = getattr(server, "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
         # Stubbed sessions return a non-awaitable, or there is no child-watcher to race: plain await.
@@ -587,7 +665,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
-                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                    result = await _call_tool_racing_stdio_death(
+                        server,
+                        server_name,
+                        tool_name,
+                        args,
+                        meta=_trusted_hermes_request_meta(server_name, kwargs),
+                    )
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy

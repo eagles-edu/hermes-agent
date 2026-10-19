@@ -408,6 +408,10 @@ def _build_hermes_tools_mcp_entry() -> dict:
     return {
         "command": sys.executable,
         "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        # Codex starts stdio servers from the workspace by default. A workspace may itself
+        # contain a top-level `tools/` namespace, which then shadows Hermes' installed tools
+        # package during startup. Pin this server to the Hermes checkout that owns the module.
+        "cwd": str(Path(__file__).resolve().parent.parent),
         "env": env,
         # Generous timeouts — browser_navigate or delegate_task can take a while.
         "startup_timeout_sec": 30.0,

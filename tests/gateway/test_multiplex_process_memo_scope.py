@@ -104,6 +104,60 @@ async def test_gateway_hooks_fire_per_routed_profile(two_homes):
     assert ctx_b.get("seen") == ["hermes_hook_hook-b"]
 
 
+@pytest.mark.asyncio
+async def test_codex_outboxes_follow_pinned_profile_a_to_b_to_a(two_homes):
+    """Durable Codex records stay in each profile's outbox across scope switches."""
+    a, b = two_homes
+    for home, hook_name in ((a, "curator-a"), (b, "curator-b")):
+        hook_dir = home / "hooks" / hook_name
+        hook_dir.mkdir(parents=True)
+        (hook_dir / "HOOK.yaml").write_text(
+            f"name: {hook_name}\nevents: ['codex:turn:start']\n"
+            "durable_events: ['codex:turn:start']\n",
+            encoding="utf-8",
+        )
+        (hook_dir / "handler.py").write_text(
+            "def handle(event_type, context):\n    return True\n", encoding="utf-8"
+        )
+    from gateway.hooks import ProfileHookRegistries
+
+    registries = ProfileHookRegistries()
+    registry_a = registries.for_current_profile()
+    assert registry_a._outbox.bind_goal("project-a", "session-a", "goal-a")
+    event_a1 = registry_a.queue_durable_event(
+        "codex:turn:start", {"attempt_id": "attempt-a1", "session_id": "session-a"}
+    )
+    token = set_hermes_home_override(str(b))
+    try:
+        registry_b = registries.for_current_profile()
+        assert registry_b._outbox.bind_goal("project-b", "session-b", "goal-b")
+        event_b = registry_b.queue_durable_event(
+            "codex:turn:start", {"attempt_id": "attempt-b", "session_id": "session-b"}
+        )
+    finally:
+        reset_hermes_home_override(token)
+    registry_a_again = registries.for_current_profile()
+    event_a2 = registry_a_again.queue_durable_event(
+        "codex:turn:start", {"attempt_id": "attempt-a2", "session_id": "session-a"}
+    )
+
+    assert event_a1["source_id"] == event_a2["source_id"]
+    assert event_a1["project_id"] == "project-a"
+    assert event_a1["goal_id"] == "goal-a"
+    assert event_a1["source_sequence"] == 1
+    assert event_a2["source_sequence"] == 2
+    assert event_b["source_id"] != event_a1["source_id"]
+    assert event_b["project_id"] == "project-b"
+    assert event_b["goal_id"] == "goal-b"
+    assert event_b["source_sequence"] == 1
+    assert [item["context"]["session_id"] for item in registry_a_again._outbox.pending()] == [
+        "session-a", "session-a"
+    ]
+    assert [item["context"]["session_id"] for item in registry_b._outbox.pending()] == ["session-b"]
+    registry_a_again._outbox.close()
+    registry_b._outbox.close()
+
+
 def test_media_policy_reads_routed_profile_config_not_env(two_homes, monkeypatch):
     a, b = two_homes
     from gateway import media_policy

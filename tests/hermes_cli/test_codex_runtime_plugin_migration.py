@@ -395,6 +395,15 @@ class TestHermesHomeLeakGuard:
         env = entry.get("env", {})
         assert env.get("HERMES_HOME") == real_path
 
+    def test_hermes_tools_cwd_is_hermes_package_root(self):
+        from pathlib import Path
+
+        from hermes_cli import codex_runtime_plugin_migration as migration
+
+        entry = _build_hermes_tools_mcp_entry()
+
+        assert entry["cwd"] == str(Path(migration.__file__).resolve().parent.parent)
+
     def test_unset_hermes_home_omits_env_key(self, monkeypatch):
         """When HERMES_HOME is unset in the environment, the MCP entry MUST
         NOT bake in a resolved-default path. The codex subprocess should

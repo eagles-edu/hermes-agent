@@ -2,11 +2,15 @@
 
 Hooks live in ~/.hermes/hooks/<name>/ with HOOK.yaml (name, description, events) and
 handler.py (``def handle(event_type, context)``, sync or async); errors never block
-the pipeline.  Events: gateway:startup, session:start/end/reset, agent:start,
-agent:step (each tool-loop turn), agent:end, command:* (wildcard).  agent:* context:
-platform, user_id, chat_id, thread_id ("" outside a thread), chat_type
-("dm"|"group"|"forum"|""), session_id, message (500 chars); agent:end adds response,
-model, provider.  Forum follow-ups pass ``message_thread_id=int(thread_id)``.
+the pipeline. Events include gateway:startup, session:start/end/reset, agent:start,
+agent:step (each tool-loop turn), agent:end, Codex app-server ``codex:turn:start`` /
+``codex:turn:end``, and command:* (wildcard). ``agent:*`` context includes platform,
+user_id, chat_id, thread_id ("" outside a thread), chat_type ("dm"|"group"|"forum"|""),
+session_id, and message (500 chars); agent:end adds response, model, and provider. Codex
+turn events contain only bounded session/attempt/model/provider/cwd metadata; the end event
+also carries the Codex turn id and runtime outcome. They never contain prompt/response text,
+tool arguments/results, or exception text, and a runtime outcome is not goal-success evidence.
+Forum follow-ups pass ``message_thread_id=int(thread_id)``.
 """
 
 import asyncio
@@ -19,7 +23,9 @@ from typing import Any, Callable, Dict, List, Optional
 import hermes_yaml as yaml
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import hermes_home_key
+from hermes_constants import hermes_home_key, profile_name_for_home
+
+from gateway.codex_outbox import CodexLifecycleOutbox
 
 
 HOOKS_DIR = get_hermes_home() / "hooks"
@@ -41,7 +47,7 @@ def _skip(name: str, reason: str) -> None:
 
 
 def _load_hook_dir(hook_dir: Path) -> Optional[tuple]:
-    """``(name, events, handle_fn, description)`` for a valid hook dir, else None (reason printed)."""
+    """``(name, events, durable_events, handle_fn, description)`` for a valid hook dir."""
     manifest_path, handler_path = hook_dir / "HOOK.yaml", hook_dir / "handler.py"
     if not manifest_path.exists() or not handler_path.exists():
         return None
@@ -52,6 +58,12 @@ def _load_hook_dir(hook_dir: Path) -> Optional[tuple]:
     events = manifest.get("events", [])
     if not events:
         return _skip(hook_name, "no events declared")
+    durable_events = manifest.get("durable_events", [])
+    if not isinstance(durable_events, list) or any(
+        event not in {"codex:turn:start", "codex:turn:end"} or event not in events
+        for event in durable_events
+    ):
+        return _skip(hook_name, "durable_events must opt in to declared Codex lifecycle events only")
     # Register in sys.modules BEFORE exec_module so Pydantic/dataclass forward references
     # (``from __future__ import annotations``) resolve; otherwise a handler declaring a
     # BaseModel fails at first dispatch with "TypeAdapter ... is not fully defined".
@@ -69,7 +81,7 @@ def _load_hook_dir(hook_dir: Path) -> Optional[tuple]:
     handle_fn = getattr(module, "handle", None)
     if handle_fn is None:
         return _skip(hook_name, "no 'handle' function found")
-    return hook_name, events, handle_fn, manifest.get("description", "")
+    return hook_name, events, durable_events, handle_fn, manifest.get("description", "")
 
 
 class HookRegistry:
@@ -102,13 +114,27 @@ class HookRegistry:
                 continue
             if loaded is None:
                 continue
-            hook_name, events, handle_fn, description = loaded
+            hook_name, events, durable_events, handle_fn, description = loaded
             for event in events:
                 self._handlers.setdefault(event, []).append(handle_fn)
+            for event in durable_events:
+                self._durable_handlers.setdefault(event, []).append(handle_fn)
             self._loaded_hooks.append(
-                {"name": hook_name, "description": description, "events": events, "path": str(hook_dir)}
+                {
+                    "name": hook_name,
+                    "description": description,
+                    "events": events,
+                    "durable_events": durable_events,
+                    "path": str(hook_dir),
+                }
             )
             print(f"[hooks] Loaded hook '{hook_name}' for events: {events}", flush=True)
+        if self._durable_handlers:
+            home = hooks_dir.parent
+            self._outbox = CodexLifecycleOutbox(
+                home / "curatormd" / "codex-outbox.sqlite3",
+                profile_id=profile_name_for_home(home) or home.name,
+            )
 
     def _resolve_handlers(self, event_type: str) -> list[Callable]:
         """Exact-match handlers first, then ``<base>:*`` wildcards.  A bare base type
@@ -136,6 +162,8 @@ class HookRegistry:
                     results.append(result)
             except Exception as e:
                 print(f"[hooks] Error in handler for '{event_type}': {e}", flush=True)
+        if event_type == "gateway:startup":
+            await self.drain_durable()
         return results
 
 
@@ -165,6 +193,14 @@ class ProfileHookRegistries:
                     registry.discover_and_load()
                     self._by_home[key] = registry
         return registry
+
+    def for_current_profile(self) -> HookRegistry:
+        """Resolve and pin the active profile's registry while its runtime scope is bound.
+
+        Agent callbacks may run in executor threads. Capturing this registry when a turn
+        is wired prevents a callback from depending on a later context-variable lookup.
+        """
+        return self._active()
 
     @property
     def loaded_hooks(self) -> list[dict]:

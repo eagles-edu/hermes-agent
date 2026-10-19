@@ -146,6 +146,79 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_codex_lifecycle_hook_events_are_correlated_and_do_not_copy_chat_content(self, fake_session):
+        events = []
+        agent = _make_codex_agent(
+            model="gpt-6-luna",
+            event_callback=lambda name, payload: events.append((name, payload)),
+        )
+        agent.session_cwd = "/work/gptmd"
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("private user prompt")
+
+        assert result["completed"] is True
+        assert [name for name, _ in events] == ["codex:turn:start", "codex:turn:end"]
+        start_name, start = events[0]
+        end_name, end = events[1]
+        assert start_name == "codex:turn:start"
+        assert end_name == "codex:turn:end"
+        assert start["attempt_id"] == end["attempt_id"]
+        assert start["session_id"] == end["session_id"] == agent.session_id
+        assert start["cwd"] == end["cwd"] == "/work/gptmd"
+        assert end["turn_id"] == "turn-stub-1"
+        assert end["outcome"] == "completed"
+        assert set(start) == {"attempt_id", "session_id", "model", "provider", "cwd"}
+        assert set(end) == {
+            "attempt_id",
+            "session_id",
+            "model",
+            "provider",
+            "cwd",
+            "turn_id",
+            "outcome",
+        }
+        assert "private user prompt" not in repr(events)
+        assert "echo: private user prompt" not in repr(events)
+
+    def test_codex_lifecycle_failure_event_omits_exception_text(self, monkeypatch):
+        def fail_run_turn(self, user_input: str, **kwargs):
+            raise RuntimeError("sensitive upstream error text")
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fail_run_turn)
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "thread-failure")
+        events = []
+        agent = _make_codex_agent(event_callback=lambda name, payload: events.append((name, payload)))
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("another private prompt")
+
+        assert result["completed"] is False
+        assert [name for name, _ in events] == ["codex:turn:start", "codex:turn:end"]
+        assert events[0][1]["attempt_id"] == events[1][1]["attempt_id"]
+        assert events[1][1]["outcome"] == "failed"
+        assert events[1][1]["failure_kind"] == "exception"
+        assert "sensitive upstream error text" not in repr(events)
+        assert "another private prompt" not in repr(events)
+
+    def test_codex_lifecycle_reports_postprocess_failure_without_exception_text(
+        self, monkeypatch, fake_session
+    ):
+        def fail_postprocess(*args, **kwargs):
+            raise RuntimeError("private persistence error details")
+
+        monkeypatch.setattr("agent.codex_runtime._finish_codex_turn", fail_postprocess)
+        events = []
+        agent = _make_codex_agent(event_callback=lambda name, payload: events.append((name, payload)))
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            with pytest.raises(RuntimeError, match="private persistence error details"):
+                agent.run_conversation("private goal text")
+
+        assert [name for name, _ in events] == ["codex:turn:start", "codex:turn:end"]
+        assert events[0][1]["attempt_id"] == events[1][1]["attempt_id"]
+        assert events[1][1]["outcome"] == "failed"
+        assert events[1][1]["failure_kind"] == "postprocess_exception"
+        assert "private persistence error details" not in repr(events)
+        assert "private goal text" not in repr(events)
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
@@ -232,7 +305,14 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_prompt_tokens == 300_000
         assert agent.context_compressor.awaiting_real_usage_after_compression is False
         assert agent.context_compressor._ineffective_compression_count == 1
-        assert events == [
+        assert [event_type for event_type, _ in events] == [
+            "codex:turn:start",
+            "session:compress",
+            "codex:turn:end",
+        ]
+        assert events[0][1]["attempt_id"] == events[2][1]["attempt_id"]
+        assert events[2][1]["outcome"] == "completed"
+        assert [event for event in events if event[0] == "session:compress"] == [
             (
                 "session:compress",
                 {

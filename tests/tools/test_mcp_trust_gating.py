@@ -106,6 +106,111 @@ class TestTrustGateAtCallTime:
         assert json.loads(raw) == {"result": "ok"}
         fake_session.call_tool.assert_awaited_once()
 
+    def test_hermes_request_context_is_opt_in_and_not_a_tool_argument(self, fake_session):
+        """Only an operator-opted-in local stdio server receives host-owned context."""
+        metadata = {"hermes/profile_id": "gptmd-coding", "hermes/session_id": "session-17"}
+        with patch(
+            "tools.mcp_tool_handlers._trusted_hermes_request_meta", return_value=metadata
+        ) as context_meta:
+            handler = _mcp_handlers._make_tool_handler("srv", "curator_bind_goal", 30.0)
+            raw = handler({"goal_id": "goal-9"}, session_id="session-17")
+
+        context_meta.assert_called_once_with("srv", {"session_id": "session-17"})
+        fake_session.call_tool.assert_awaited_once_with(
+            "curator_bind_goal", arguments={"goal_id": "goal-9"}, meta=metadata
+        )
+        assert json.loads(raw) == {"result": "ok"}
+
+    def test_successful_goal_activation_persists_profile_local_binding(self, tmp_path):
+        """Only explicit active-goal MCP results bind the host session to a project goal."""
+        from gateway.codex_outbox import CodexLifecycleOutbox
+
+        home = tmp_path / "profiles" / "gptmd-coding"
+        with patch(
+            "hermes_cli.mcp_config._get_mcp_servers",
+            return_value={
+                "srv": {
+                    "command": "curatormd-v2-mcp",
+                    "hermes_context": True,
+                    "hermes_project_id": "gptmd",
+                }
+            },
+        ), patch("hermes_constants.get_hermes_home", return_value=home), patch(
+            "hermes_constants.profile_name_for_home", return_value="gptmd-coding"
+        ):
+            assert _mcp_handlers._bind_hermes_active_goal(
+                "srv",
+                "goal_start",
+                {"goal_id": "goal-1", "initial_status": "planned"},
+                {"session_id": "session-1"},
+                SimpleNamespace(isError=False),
+            ) is None
+            assert _mcp_handlers._bind_hermes_active_goal(
+                "srv",
+                "goal_activate",
+                {"goal_id": "goal-1"},
+                {"session_id": "session-1"},
+                SimpleNamespace(isError=False),
+            ) is True
+
+        outbox = CodexLifecycleOutbox(
+            home / "curatormd" / "codex-outbox.sqlite3", profile_id="gptmd-coding"
+        )
+        event = outbox.enqueue(
+            "codex:turn:start", {"attempt_id": "attempt-1", "session_id": "session-1"}
+        )
+        assert event is not None
+        assert event["project_id"] == "gptmd"
+        assert event["goal_id"] == "goal-1"
+        assert event["source_id"].startswith("hermes-")
+        assert len(event["source_id"]) == len("hermes-") + 64
+        outbox.close()
+
+    def test_hermes_request_context_requires_explicit_local_stdio_opt_in(self):
+        """Remote or non-opted-in MCP servers never receive profile/session metadata."""
+        from tools.mcp_tool_handlers import _trusted_hermes_request_meta
+
+        with patch(
+            "hermes_cli.mcp_config._get_mcp_servers",
+            return_value={"srv": {"command": "curator", "hermes_context": True}},
+        ), patch("hermes_constants.get_hermes_home", return_value="/profiles/gptmd-coding"), patch(
+            "hermes_constants.profile_name_for_home", return_value="gptmd-coding"
+        ):
+            assert _trusted_hermes_request_meta("srv", {"session_id": "session-17"}) == {
+                "hermes/profile_id": "gptmd-coding",
+                "hermes/session_id": "session-17",
+            }
+            assert _trusted_hermes_request_meta(
+                "srv", {"session_id": "session-17", "hermes_durable_event": True}
+            ) == {
+                "hermes/profile_id": "gptmd-coding",
+                "hermes/session_id": "session-17",
+                "hermes/durable_event": True,
+            }
+
+        with patch(
+            "hermes_cli.mcp_config._get_mcp_servers",
+            return_value={"srv": {"command": "curator"}},
+        ):
+            assert _trusted_hermes_request_meta("srv", {"session_id": "session-17"}) is None
+
+        for config in (
+            {"url": "https://curator.example/mcp", "hermes_context": True},
+            {"command": "curator", "url": "https://curator.example/mcp", "hermes_context": True},
+        ):
+            with patch("hermes_cli.mcp_config._get_mcp_servers", return_value={"srv": config}):
+                with pytest.raises(RuntimeError, match="requires an explicitly opted-in stdio"):
+                    _trusted_hermes_request_meta("srv", {"session_id": "session-17"})
+
+        with patch(
+            "hermes_cli.mcp_config._get_mcp_servers",
+            return_value={"srv": {"command": "curator", "hermes_context": True}},
+        ), patch("hermes_constants.get_hermes_home", return_value="/custom/home"), patch(
+            "hermes_constants.profile_name_for_home", return_value=None
+        ):
+            with pytest.raises(RuntimeError, match="profile or session context is unavailable"):
+                _trusted_hermes_request_meta("srv", {"session_id": "session-17"})
+
     def test_denied_approval_blocks_rpc(self, fake_session):
         """'decline' blocks the call — the RPC must never fire."""
         _set_trust("srv", "untrusted")

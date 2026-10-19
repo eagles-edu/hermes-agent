@@ -2206,7 +2206,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         )
         # Bridges: sync step/event/status callbacks → async hooks.emit and adapter.send.
         turn_ctx._loop_for_step = asyncio.get_running_loop()
-        turn_ctx._hooks_ref = self.hooks
+        pin_profile_registry = getattr(self.hooks, "for_current_profile", None)
+        turn_ctx._hooks_ref = pin_profile_registry() if callable(pin_profile_registry) else self.hooks
         turn_ctx._step_callback_sync = turn_runner._step_callback_sync
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync

@@ -34,6 +34,8 @@ mcp_servers:
     timeout: 120
     connect_timeout: 60
     supports_parallel_tool_calls: false
+    hermes_context: false  # optional; stdio only
+    hermes_project_id: null # optional; Curator project ID from its repository config
     tools:
       include: []
       exclude: []
@@ -58,6 +60,8 @@ mcp_servers:
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
 | `protocol` | string | both | Protocol-era negotiation: `auto` (default — legacy `initialize` handshake first, falling back to the 2026-07-28 `server/discover` stateless probe when the server rejects the handshake as modern-only), `stateless` (probe `server/discover` first; one legacy retry), or `legacy` (handshake only, no fallback) |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
+| `hermes_context` | bool | stdio | When explicitly `true`, attach the active Hermes profile ID and current session ID as request `_meta` on tool calls. These host-owned values are not model tool arguments. Internal durable-event dispatches also include a host-only marker; ordinary model calls cannot set it. The receiving server can read these values, so enable only for a local stdio server you trust; invalid transport or unavailable context fails closed. This is correlation context, not proof of human authentication or task success. |
+| `hermes_project_id` | string | stdio | Repository's Curator project ID, copied from its `.curatormd-v2.toml` by the project plugin setup. Hermes uses it to bind an activated goal in the profile-local outbox. It is operator configuration, not MCP caller input; require it only with `hermes_context: true`. |
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `transport` | string | HTTP | Set to `sse` to use the SSE transport instead of Streamable HTTP |
 | `keepalive_interval` | number | both | Liveness ping cadence in seconds (floored at 5s). HTTP defaults to `180`; set it below the server's session TTL when the server GC's idle sessions quickly. Stdio disables keepalive when omitted; set a value to opt in explicitly |

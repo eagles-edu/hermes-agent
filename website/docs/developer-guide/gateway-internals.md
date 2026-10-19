@@ -638,7 +638,16 @@ Gateway hooks are Python modules that respond to lifecycle events:
 | `agent:start` | Agent begins processing a message |
 | `agent:step` | Agent completes one tool-calling iteration |
 | `agent:end` | Agent finishes and returns response |
+| `codex:turn:start` | A Codex app-server turn is about to be dispatched |
+| `codex:turn:end` | The Codex app-server turn returned, was interrupted, or failed |
 | `command:*` | Any slash command is executed |
+
+Codex lifecycle events are emitted only for `codex_app_server` turns. Their bounded context
+contains the session and attempt ids, model/provider, and working directory when available;
+the end event adds the Codex turn id and runtime outcome (`completed`, `interrupted`, or
+`failed`). It excludes prompt/response text, tool arguments/results, and exception text. A
+runtime `completed` outcome only means the Codex turn returned without an interruption or
+runtime error; it is not evidence that a development goal or its success criteria passed.
 
 Hooks are discovered from `gateway/builtin_hooks/` (an extension point — currently empty in the shipped distribution; `_register_builtin_hooks()` is a no-op stub) and `<profile home>/hooks/` (user-installed; `~/.hermes/hooks/` for the default profile, one directory per served profile under multiplexing — paths resolve at call time, never at import). Each hook is a directory with a `HOOK.yaml` manifest and `handler.py`.
 

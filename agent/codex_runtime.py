@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -56,6 +57,45 @@ def _call_guarded(fn: Callable | None, fail_msg: str, *fail_args: Any, args: tup
         fn(*args, **(kwargs or {}))
     except Exception:
         logger.debug(fail_msg, *fail_args, exc_info=True)
+
+
+def _emit_codex_lifecycle_event(
+    agent: Any,
+    event_type: str,
+    *,
+    attempt_id: str,
+    outcome: str | None = None,
+    turn_id: str | None = None,
+    failure_kind: str | None = None,
+) -> None:
+    """Emit bounded Codex runtime metadata to the active Gateway hook registry.
+
+    Deliberately exclude prompt/response text, tool arguments/results, and exception messages:
+    Gateway hooks run trusted in-process code and can forward their payloads elsewhere. The
+    profile-specific registry is selected by the Gateway at emit time; these events are runtime
+    observations, not goal-success evidence.
+    """
+    callback = getattr(agent, "event_callback", None)
+    if callback is None:
+        return
+    context: dict[str, str] = {"attempt_id": attempt_id}
+    for key, value, limit in (
+        ("session_id", getattr(agent, "session_id", None), 256),
+        ("model", getattr(agent, "model", None), 128),
+        ("provider", getattr(agent, "provider", None), 128),
+        ("cwd", getattr(agent, "session_cwd", None), 4096),
+        ("turn_id", turn_id, 256),
+        ("outcome", outcome, 32),
+        ("failure_kind", failure_kind, 32),
+    ):
+        if isinstance(value, str) and value:
+            context[key] = value[:limit]
+    _call_guarded(
+        callback,
+        "Codex lifecycle event callback raised for %s",
+        event_type,
+        args=(event_type, context),
+    )
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -733,6 +773,8 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent, messages)
+    attempt_id = uuid.uuid4().hex
+    _emit_codex_lifecycle_event(agent, "codex:turn:start", attempt_id=attempt_id)
     try:
         _start_codex_thread(agent)
         wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
@@ -743,22 +785,56 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)
+        _emit_codex_lifecycle_event(
+            agent,
+            "codex:turn:end",
+            attempt_id=attempt_id,
+            outcome="failed",
+            failure_kind="exception",
+        )
         return _turn_result(
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
             final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
         )
-    interrupt = _consume_user_interrupt(agent, turn.interrupted)
-    # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool
-    # silence alone no longer retires — it only logs a warning (#112928).
-    if getattr(turn, "should_retire", False):
-        logger.warning("codex app-server session retired (turn error: %s)", turn.error)
-        _close_codex_session(agent)
-    # The binding is published only once the transcript it belongs to is durable, and never for a
-    # retired thread (the next agent would only resume into the same wedge).
-    if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
-        _store_codex_thread_id(agent, turn.thread_id)
-    usage_result = _finish_codex_turn(
-        agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
+    try:
+        interrupt = _consume_user_interrupt(agent, turn.interrupted)
+        # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool
+        # silence alone no longer retires — it only logs a warning (#112928).
+        if getattr(turn, "should_retire", False):
+            logger.warning("codex app-server session retired (turn error: %s)", turn.error)
+            _close_codex_session(agent)
+        # The binding is published only once the transcript it belongs to is durable, and never for a
+        # retired thread (the next agent would only resume into the same wedge).
+        if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
+            _store_codex_thread_id(agent, turn.thread_id)
+        usage_result = _finish_codex_turn(
+            agent, turn, messages, original_user_message=original_user_message,
+            should_review_memory=should_review_memory,
+        )
+    except Exception:
+        _emit_codex_lifecycle_event(
+            agent,
+            "codex:turn:end",
+            attempt_id=attempt_id,
+            turn_id=turn.turn_id,
+            outcome="failed",
+            failure_kind="postprocess_exception",
+        )
+        raise
+    outcome = (
+        "interrupted"
+        if turn.interrupted
+        else "failed"
+        if turn.error is not None
+        else "completed"
+    )
+    _emit_codex_lifecycle_event(
+        agent,
+        "codex:turn:end",
+        attempt_id=attempt_id,
+        turn_id=turn.turn_id,
+        outcome=outcome,
+        failure_kind="codex_error" if turn.error is not None else None,
     )
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,

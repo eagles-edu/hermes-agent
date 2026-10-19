@@ -2355,7 +2355,7 @@ async def handle(event_type: str, context: dict) -> None:
         pass
 ```
 
-Events include `gateway:startup`, `session:start`, `session:end`, `session:reset`, `agent:start`, `agent:step`, `agent:end`, and wildcard `command:*`. Errors in hooks are caught and logged — they never block the main pipeline.
+Events include `gateway:startup`, `session:start`, `session:end`, `session:reset`, `agent:start`, `agent:step`, `agent:end`, Codex app-server `codex:turn:start` / `codex:turn:end`, and wildcard `command:*`. Codex lifecycle payloads contain bounded runtime metadata only, not prompts, responses, tool arguments/results, or exception text; `outcome: completed` is not goal-success evidence. Errors in hooks are caught and logged — they never block the main pipeline.
 
 **Full guide:** [Gateway Event Hooks](../../user-guide/features/hooks.md#gateway-event-hooks).
 
