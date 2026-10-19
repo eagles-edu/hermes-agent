@@ -7,7 +7,7 @@ restart or a failed handler can retry the same event ID and source sequence.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import hashlib
 import json
 import os
@@ -113,9 +113,9 @@ class CodexLifecycleOutbox:
         if not _PROFILE_ID_RE.fullmatch(profile_id):
             return False
         source_id = "hermes-" + hashlib.sha256(
-            f"{profile_id}\0{project_id}".encode("utf-8")
+            f"{profile_id}\0{project_id}".encode()
         ).hexdigest()
-        bound_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        bound_at = datetime.now(UTC).isoformat(timespec="microseconds")
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -166,7 +166,7 @@ class CodexLifecycleOutbox:
             if not isinstance(context.get("outcome"), str) or context["outcome"] not in _OUTCOME_VALUES:
                 return None
 
-        now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        now = datetime.now(UTC).isoformat(timespec="microseconds")
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
