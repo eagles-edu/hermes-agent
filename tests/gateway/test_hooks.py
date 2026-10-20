@@ -238,6 +238,94 @@ class TestEmit:
         second._outbox.close()
 
     @pytest.mark.asyncio
+    async def test_codex_durable_delivery_uses_managed_mcp_hook_context(self, tmp_path):
+        """A persisted Codex event reaches the allowlisted MCP route before ack."""
+        from tools import mcp_tool_handlers
+
+        hook_dir = tmp_path / "curator"
+        hook_dir.mkdir()
+        (hook_dir / "HOOK.yaml").write_text(
+            "name: curator\n"
+            "events: ['codex:turn:start']\n"
+            "durable_events: ['codex:turn:start']\n"
+        )
+        (hook_dir / "handler.py").write_text(
+            "def handle(event_type, context, *, ctx):\n"
+            "    response = ctx.call_mcp(\n"
+            "        'curator-mcp', 'hermes_codex_event',\n"
+            "        {'event_type': event_type, 'project_id': context['project_id'],\n"
+            "         'goal_id': context['goal_id'], 'event_id': context['event_id'],\n"
+            "         'source_id': context['source_id'],\n"
+            "         'source_sequence': context['source_sequence'],\n"
+            "         'occurred_at': context['occurred_at'],\n"
+            "         'context': {'attempt_id': context['attempt_id'],\n"
+            "                     'session_id': context['session_id']}},\n"
+            "        session_id=context['session_id'], hermes_durable_event=True)\n"
+            "    receipt = response.get('result', {})\n"
+            "    return response.get('ok') is True and receipt.get('status') in {\n"
+            "        'processed', 'duplicate'}\n"
+        )
+
+        calls = []
+
+        def make_handler(server, tool, timeout):
+            def invoke(arguments, **request_context):
+                calls.append((server, tool, timeout, arguments, request_context))
+                return '{"result":{"status":"processed"}}'
+
+            return invoke
+
+        registry = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(registry):
+            registry.discover_and_load()
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "hooks": {
+                    "entries": {"curator": {"mcp_allowlist": ["curator-mcp"]}}
+                }
+            },
+        ), patch.object(mcp_tool_handlers, "_make_tool_handler", side_effect=make_handler):
+            assert registry._outbox is not None
+            assert registry._outbox.bind_goal("project-1", "session-1", "goal-1")
+            event = registry.queue_durable_event(
+                "codex:turn:start",
+                {
+                    "attempt_id": "attempt-1",
+                    "session_id": "session-1",
+                    "model": "must-not-be-retained",
+                    "cwd": "/private/repository",
+                },
+            )
+            assert event is not None
+            assert "model" not in event["context"]
+            assert "cwd" not in event["context"]
+            assert await registry.emit_durable(event)
+            assert registry._outbox.pending() == []
+
+        assert len(calls) == 1
+        server, tool, timeout, arguments, request_context = calls[0]
+        assert (server, tool, timeout) == (
+            "curator-mcp",
+            "hermes_codex_event",
+            30.0,
+        )
+        assert arguments["project_id"] == "project-1"
+        assert arguments["goal_id"] == "goal-1"
+        assert arguments["event_id"] == event["event_id"]
+        assert arguments["source_sequence"] == event["source_sequence"] == 1
+        assert arguments["context"] == {
+            "attempt_id": "attempt-1",
+            "session_id": "session-1",
+        }
+        assert request_context == {
+            "session_id": "session-1",
+            "hermes_durable_event": True,
+        }
+        assert registry._outbox is not None
+        registry._outbox.close()
+
+    @pytest.mark.asyncio
     async def test_codex_usage_is_project_scoped_local_and_content_free(self, tmp_path):
         hook_dir = tmp_path / "curator"
         hook_dir.mkdir()
