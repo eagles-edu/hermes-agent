@@ -551,8 +551,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                         "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
                     )},
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot.
-                    # See #60955.
+                    # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
                 try:

@@ -1,0 +1,10 @@
+name: project-usage
+version: 0.1.0
+description: "Read-only project-scoped Codex usage summary from this Hermes profile's local ledger."
+provides_tools:
+  - project_usage
+config_schema:
+  project_id:
+    type: str
+    default: ""
+    description: "One exact project ID to read from this profile's local usage ledger."

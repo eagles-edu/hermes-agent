@@ -122,7 +122,7 @@ def _bind_hermes_active_goal(
             return outbox.bind_goal(project_id, session_id, goal_id)
         finally:
             outbox.close()
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- binding is best-effort after the durable goal transition.
         # The tool's goal transition already succeeded. Do not report it as failed
         # or invite a duplicate write; surface only a bounded status to the model.
         logger.warning("Curator goal binding was not recorded (%s)", type(exc).__name__)

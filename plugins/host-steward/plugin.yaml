@@ -1,14 +1,20 @@
 name: host-steward
 version: 0.1.0
-description: "Root-account, read-only host disk inventory and reviewable cleanup proposals."
+description: "Root-account host disk inventory with one-time approval-gated managed cache cleanup and receipts."
 provides_tools:
   - host_inventory
   - host_proposals
+  - host_cleanup
+  - host_cleanup_receipts
+  - host_cleanup_reconcile
+provides_hooks:
+  - pre_tool_call
+  - post_approval_response
 config_schema:
   targets:
     type: list
     default: []
-    description: "Explicit host paths and owner/action/recovery metadata to inventory."
+    description: "Explicit host paths and registered managed-action/owner/recovery metadata."
   max_entries_per_target:
     type: int
     default: 20000

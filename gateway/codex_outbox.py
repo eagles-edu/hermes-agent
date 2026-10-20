@@ -3,6 +3,8 @@
 Only a deliberately small allowlist of correlation fields is retained. The
 queue stores the exact event envelope passed to durable hook handlers so a
 restart or a failed handler can retry the same event ID and source sequence.
+Reported token counts are stored separately in this profile's local usage ledger
+and are never included in hook deliveries.
 """
 
 from __future__ import annotations
@@ -29,9 +31,14 @@ _EVENT_FIELDS = {
 _ACCEPTED_FIELDS = {
     "codex:turn:start": frozenset({"attempt_id", "session_id", "model", "provider", "cwd"}),
     "codex:turn:end": frozenset(
-        {"attempt_id", "session_id", "model", "provider", "cwd", "turn_id", "outcome", "failure_kind"}
+        {"attempt_id", "session_id", "model", "provider", "cwd", "turn_id", "outcome", "failure_kind", "usage"}
     ),
 }
+_USAGE_FIELDS = frozenset({
+    "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+    "cache_write_tokens", "reasoning_tokens",
+})
+_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+ -]{0,127}$")
 _OUTCOME_VALUES = frozenset({"completed", "interrupted", "failed"})
 _PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$")
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$")
@@ -86,6 +93,27 @@ class CodexLifecycleOutbox:
         self._connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS active_goal_binding_session "
             "ON active_goal_bindings(session_id)"
+        )
+        self._connection.execute(
+            """CREATE TABLE IF NOT EXISTS project_usage_events (
+                event_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                goal_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                usage_status TEXT NOT NULL CHECK (usage_status IN ('reported', 'unknown')),
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                total_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                reasoning_tokens INTEGER
+            )"""
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS project_usage_project_time "
+            "ON project_usage_events(project_id, occurred_at)"
         )
         self._connection.execute(
             """CREATE TABLE IF NOT EXISTS goal_binding_history (
@@ -194,15 +222,20 @@ class CodexLifecycleOutbox:
                     (event_id,),
                 ).fetchone()
                 if existing is not None:
-                    envelope = json.loads(existing[2])
-                    envelope.update(
-                        event_id=event_id,
-                        source_id=source_id,
-                        source_sequence=int(existing[0]),
-                        occurred_at=existing[1],
-                        project_id=existing[3],
-                        goal_id=existing[4],
-                    )
+                    envelope = {
+                        "event_id": event_id,
+                        "source_id": source_id,
+                        "source_sequence": int(existing[0]),
+                        "occurred_at": existing[1],
+                        "project_id": existing[3],
+                        "goal_id": existing[4],
+                        "event_type": event_type,
+                        "context": json.loads(existing[2]),
+                    }
+                    if event_type == "codex:turn:end":
+                        self._record_project_usage(
+                            event_id, existing[3], existing[4], existing[1], context
+                        )
                     self._connection.commit()
                     return envelope
                 retained_context = {key: context[key] for key in sorted(allowed) if key in context}
@@ -231,11 +264,91 @@ class CodexLifecycleOutbox:
                     "context_json, project_id, goal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (event_id, source_id, sequence, event_type, now, serialized, project_id, goal_id),
                 )
+                if event_type == "codex:turn:end":
+                    self._record_project_usage(event_id, project_id, goal_id, now, context)
                 self._connection.commit()
             except BaseException:
                 self._connection.rollback()
                 raise
         return envelope
+
+    def _record_project_usage(
+        self, event_id: str, project_id: str, goal_id: str, occurred_at: str,
+        context: Mapping[str, Any],
+    ) -> None:
+        """Keep token accounting local to Hermes; never add it to the Curator event envelope."""
+        raw_usage = context.get("usage")
+        usage: dict[str, int] = {}
+        if isinstance(raw_usage, Mapping) and not (set(raw_usage) - _USAGE_FIELDS):
+            for key, value in raw_usage.items():
+                if type(value) is not int or value < 0 or value > 10**12:
+                    usage.clear()
+                    break
+                usage[key] = value
+        status = "reported" if usage else "unknown"
+        provider = context.get("provider")
+        model = context.get("model")
+        provider = provider if isinstance(provider, str) and _LABEL_RE.fullmatch(provider) else None
+        model = model if isinstance(model, str) and _LABEL_RE.fullmatch(model) else None
+        self._connection.execute(
+            """INSERT OR IGNORE INTO project_usage_events(
+                event_id, project_id, goal_id, occurred_at, provider, model, usage_status,
+                input_tokens, output_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, reasoning_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event_id, project_id, goal_id, occurred_at, provider, model,
+             status, *(usage.get(key) for key in (
+                 "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+                 "cache_write_tokens", "reasoning_tokens",
+             ))),
+        )
+
+    def project_usage_totals(self, project_id: str) -> dict[str, int | str]:
+        """Summarize local Codex usage without returning session, goal, or event identifiers."""
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT COUNT(*), SUM(usage_status = 'reported'), SUM(usage_status = 'unknown'),
+                          SUM(input_tokens), SUM(output_tokens), SUM(total_tokens),
+                          SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(reasoning_tokens)
+                   FROM project_usage_events WHERE project_id = ?""",
+                (project_id,),
+            ).fetchone()
+        return {
+            "project_id": project_id,
+            "source": "codex_app_server",
+            "turns": int(row[0] or 0),
+            "reported_turns": int(row[1] or 0),
+            "unknown_turns": int(row[2] or 0),
+            "input_tokens": int(row[3] or 0),
+            "output_tokens": int(row[4] or 0),
+            "total_tokens": int(row[5] or 0),
+            "cache_read_tokens": int(row[6] or 0),
+            "cache_write_tokens": int(row[7] or 0),
+            "reasoning_tokens": int(row[8] or 0),
+        }
+
+    def project_usage_by_model(self, project_id: str) -> list[dict[str, int | str]]:
+        """Return aggregate token counts by provider/model, without session-level identifiers."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT provider, model, usage_status, COUNT(*), SUM(input_tokens),
+                          SUM(output_tokens), SUM(total_tokens)
+                   FROM project_usage_events WHERE project_id = ?
+                   GROUP BY provider, model, usage_status ORDER BY provider, model, usage_status""",
+                (project_id,),
+            ).fetchall()
+        return [
+            {
+                "provider": row[0] or "unknown",
+                "model": row[1] or "unknown",
+                "usage_status": row[2],
+                "turns": int(row[3] or 0),
+                "input_tokens": int(row[4] or 0),
+                "output_tokens": int(row[5] or 0),
+                "total_tokens": int(row[6] or 0),
+            }
+            for row in rows
+        ]
 
     def pending(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:

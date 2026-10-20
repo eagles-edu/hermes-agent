@@ -240,7 +240,8 @@ class TestRunConversationCodexPath:
         monkeypatch.setattr(
             CodexAppServerSession, "ensure_started", lambda self: "thread-usage-1"
         )
-        agent = _make_codex_agent()
+        events = []
+        agent = _make_codex_agent(event_callback=lambda name, payload: events.append((name, payload)))
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello")
 
@@ -268,6 +269,14 @@ class TestRunConversationCodexPath:
         assert agent.session_reasoning_tokens == 5
         assert agent.context_compressor.last_prompt_tokens == 80
         assert agent.context_compressor.last_completion_tokens == 25
+        assert events[-1][1]["usage"] == {
+            "input_tokens": 60,
+            "output_tokens": 25,
+            "total_tokens": 130,
+            "cache_read_tokens": 20,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 5,
+        }
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
 

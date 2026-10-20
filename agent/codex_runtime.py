@@ -67,6 +67,7 @@ def _emit_codex_lifecycle_event(
     outcome: str | None = None,
     turn_id: str | None = None,
     failure_kind: str | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> None:
     """Emit bounded Codex runtime metadata to the active Gateway hook registry.
 
@@ -78,7 +79,7 @@ def _emit_codex_lifecycle_event(
     callback = getattr(agent, "event_callback", None)
     if callback is None:
         return
-    context: dict[str, str] = {"attempt_id": attempt_id}
+    context: dict[str, Any] = {"attempt_id": attempt_id}
     for key, value, limit in (
         ("session_id", getattr(agent, "session_id", None), 256),
         ("model", getattr(agent, "model", None), 128),
@@ -90,6 +91,17 @@ def _emit_codex_lifecycle_event(
     ):
         if isinstance(value, str) and value:
             context[key] = value[:limit]
+    if isinstance(usage, dict):
+        safe_usage = {
+            key: value for key, value in usage.items()
+            if key in {
+                "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+                "cache_write_tokens", "reasoning_tokens",
+            }
+            and type(value) is int and 0 <= value <= 10**12
+        }
+        if safe_usage:
+            context["usage"] = safe_usage
     _call_guarded(
         callback,
         "Codex lifecycle event callback raised for %s",
@@ -835,6 +847,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         turn_id=turn.turn_id,
         outcome=outcome,
         failure_kind="codex_error" if turn.error is not None else None,
+        usage=usage_result,
     )
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,

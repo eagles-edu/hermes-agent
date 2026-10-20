@@ -159,13 +159,106 @@ class TestEmit:
         second = HookRegistry()
         with patch("gateway.hooks.HOOKS_DIR", tmp_path):
             second.discover_and_load()
-            await second.drain_durable()
+            await second.emit("agent:start", {})
         assert second._outbox.pending() == []
         assert [call[1]["event_id"] for call in first_calls] == [queued["event_id"]]
         calls = second._durable_handlers["codex:turn:start"][0].__globals__["calls"]
         assert [call[1]["event_id"] for call in calls] == [queued["event_id"], queued_second["event_id"]]
         assert [call[1]["source_sequence"] for call in calls] == [1, 2]
         second._outbox.close()
+
+    @pytest.mark.asyncio
+    async def test_codex_usage_is_project_scoped_local_and_content_free(self, tmp_path):
+        hook_dir = tmp_path / "curator"
+        hook_dir.mkdir()
+        (hook_dir / "HOOK.yaml").write_text(
+            "name: curator\n"
+            "events: ['codex:turn:end']\n"
+            "durable_events: ['codex:turn:end']\n"
+        )
+        (hook_dir / "handler.py").write_text("def handle(event_type, context): return True\n")
+
+        registry = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path):
+            registry.discover_and_load()
+        assert registry._outbox.bind_goal("project-1", "session-1", "goal-1")
+        observed_hooks = []
+        registry._handlers["codex:turn:end"].append(
+            lambda _event, value: observed_hooks.append(dict(value))
+        )
+        context = {
+            "attempt_id": "attempt-usage-1",
+            "session_id": "session-1",
+            "turn_id": "turn-usage-1",
+            "outcome": "completed",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "usage": {
+                "input_tokens": 80,
+                "output_tokens": 50,
+                "total_tokens": 130,
+                "cache_read_tokens": 10,
+            },
+        }
+        queued = registry.queue_durable_event("codex:turn:end", context)
+        assert queued is not None
+        assert "usage" not in queued["context"]
+        assert "provider" not in queued["context"]
+        assert "model" not in queued["context"]
+        await registry.emit("codex:turn:end", context)
+        assert len(observed_hooks) == 1
+        assert "usage" not in observed_hooks[0]
+        assert registry.queue_durable_event("codex:turn:end", context) == queued
+        assert registry._outbox.project_usage_totals("project-1") == {
+            "project_id": "project-1",
+            "source": "codex_app_server",
+            "turns": 1,
+            "reported_turns": 1,
+            "unknown_turns": 0,
+            "input_tokens": 80,
+            "output_tokens": 50,
+            "total_tokens": 130,
+            "cache_read_tokens": 10,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        assert registry._outbox.project_usage_by_model("project-1") == [{
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "usage_status": "reported",
+            "turns": 1,
+            "input_tokens": 80,
+            "output_tokens": 50,
+            "total_tokens": 130,
+        }]
+
+        unknown = registry.queue_durable_event(
+            "codex:turn:end",
+            {**context, "attempt_id": "attempt-usage-2", "usage": {"total_tokens": True}},
+        )
+        assert unknown is not None
+        totals = registry._outbox.project_usage_totals("project-1")
+        assert (totals["turns"], totals["reported_turns"], totals["unknown_turns"]) == (2, 1, 1)
+        assert [row["usage_status"] for row in registry._outbox.project_usage_by_model("project-1")] == [
+            "reported", "unknown"
+        ]
+        assert registry._outbox.project_usage_totals("project-2")["turns"] == 0
+        outbox_path = registry._outbox.path
+        registry._outbox.close()
+
+        from gateway.codex_outbox import CodexLifecycleOutbox
+
+        reopened = CodexLifecycleOutbox(outbox_path, profile_id="hermes-test")
+        recovered = reopened.project_usage_totals("project-1")
+        assert (recovered["turns"], recovered["reported_turns"], recovered["unknown_turns"]) == (
+            2, 1, 1
+        )
+        assert reopened.enqueue("codex:turn:end", context) == queued
+        replayed = reopened.project_usage_totals("project-1")
+        assert (replayed["turns"], replayed["reported_turns"], replayed["unknown_turns"]) == (
+            2, 1, 1
+        )
+        reopened.close()
 
 
 class TestEmitCollect:

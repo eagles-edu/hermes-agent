@@ -137,6 +137,12 @@ not completion or verification of a project goal. Hooks are loaded per Hermes pr
 profile-specific Curator adapter should still validate its repository binding and backend
 authorization; the hook's `cwd` is a routing hint, not an identity credential.
 
+When a turn has a durable project binding, Hermes also stores reported Codex token counts in a
+profile-local usage ledger. Counts are not included in hook deliveries or Curator event envelopes;
+missing provider usage is recorded as unknown, not zero. This local source currently covers
+Codex app-server turns only; cross-provider aggregation, a read interface, budgets, and retention
+policy remain open.
+
 :::tip Threaded replies
 A handler posting a follow-up message into the same Telegram forum topic should include `message_thread_id=int(thread_id)` when `chat_type == "forum"` and `thread_id` is non-empty.
 :::

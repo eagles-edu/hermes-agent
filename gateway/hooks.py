@@ -187,7 +187,7 @@ class HookRegistry:
                 matched_consumer = True
                 if result is not True:
                     acknowledged = False
-            except Exception as exc:
+            except Exception as exc:  # health: allow BLE001 -- isolate trusted hook failures without logging payload details.
                 print(
                     f"[hooks] Durable handler failed for '{event_type}': {type(exc).__name__}",
                     flush=True,
@@ -218,6 +218,10 @@ class HookRegistry:
         hooks, e.g. ``command:<name>`` policies).  A failing handler is logged, not fatal."""
         if context is None:
             context = {}
+        elif event_type in {"codex:turn:start", "codex:turn:end"} and "usage" in context:
+            # Project token accounting stays in the profile-local Hermes ledger; all hooks,
+            # including Curator consumers, receive only the established lifecycle metadata.
+            context = {key: value for key, value in context.items() if key != "usage"}
         results: list[Any] = []
         handlers = self._resolve_handlers(event_type)
         if event_type in self._durable_handlers:
@@ -231,7 +235,10 @@ class HookRegistry:
                     results.append(result)
             except Exception as e:
                 print(f"[hooks] Error in handler for '{event_type}': {e}", flush=True)
-        if event_type == "gateway:startup":
+        # The process-level startup event is emitted only for the launch profile.
+        # In multiplex mode, a secondary profile may not exist until its first
+        # turn; retry its profile-local outbox at the start of that turn too.
+        if event_type in {"gateway:startup", "agent:start"}:
             await self.drain_durable()
         return results
 

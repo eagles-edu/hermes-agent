@@ -1,0 +1,177 @@
+"""Behavioral contracts for the profile-scoped read-only project usage tool."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+
+import hermes_yaml as yaml
+
+
+def _configure(home, project_id="gptmd"):
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "plugins": {
+                "enabled": ["project-usage"],
+                "entries": {"project-usage": {"settings": {"project_id": project_id}}},
+            }
+        }),
+        encoding="utf-8",
+    )
+
+
+def _tool():
+    from hermes_cli.plugins import PluginManager
+    from tools.registry import registry
+
+    manager = PluginManager()
+    manager.discover_and_load()
+    entry = registry.get_entry("project_usage", scope=manager.scope_key)
+    assert entry is not None
+    return entry
+
+
+def _ledger_snapshot(db_path):
+    # SQLite may update its transient WAL shared-memory index while opening a
+    # mode=ro reader; the database and WAL files themselves must remain stable.
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in db_path.parent.glob(f"{db_path.name}*")
+        if path.is_file() and not path.name.endswith("-shm")
+    }
+
+
+def _record_turn(outbox, project_id, session_id, attempt_id, *, usage):
+    assert outbox.bind_goal(project_id, session_id, "goal-private")
+    return outbox.enqueue("codex:turn:end", {
+        "attempt_id": attempt_id,
+        "session_id": session_id,
+        "turn_id": f"turn-{attempt_id}",
+        "outcome": "completed",
+        "provider": "openai-codex",
+        "model": "gpt-5.6",
+        **({"usage": usage} if usage is not None else {}),
+    })
+
+
+def test_reads_only_configured_project_aggregates_without_private_ids(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _configure(home)
+
+    from gateway.codex_outbox import CodexLifecycleOutbox
+
+    outbox = CodexLifecycleOutbox(profile_id="gptmd-coding")
+    _record_turn(outbox, "gptmd", "session-private", "attempt-reported", usage={
+        "input_tokens": 100,
+        "output_tokens": 25,
+        "total_tokens": 125,
+        "cache_read_tokens": 10,
+        "cache_write_tokens": 4,
+        "reasoning_tokens": 8,
+    })
+    _record_turn(outbox, "gptmd", "session-unknown", "attempt-unknown", usage=None)
+    _record_turn(outbox, "another-project", "session-other", "attempt-other", usage={
+        "input_tokens": 999,
+        "output_tokens": 999,
+        "total_tokens": 1998,
+    })
+
+    db_path = home / "curatormd" / "codex-outbox.sqlite3"
+    before = _ledger_snapshot(db_path)
+    entry = _tool()
+    report = json.loads(entry.handler({}))
+    after = _ledger_snapshot(db_path)
+
+    assert report["status"] == "available"
+    assert report["coverage"].startswith("Codex app-server turns")
+    assert report["project_id"] == "gptmd"
+    assert report["turns"] == 2
+    assert report["reported_turns"] == 1
+    assert report["unknown_usage_turns"] == 1
+    assert report["tokens"] == {
+        "input": 100,
+        "output": 25,
+        "total": 125,
+        "cache_read": 10,
+        "cache_write": 4,
+        "reasoning": 8,
+    }
+    assert report["by_provider_model"] == [{
+        "provider": "openai-codex",
+        "model": "gpt-5.6",
+        "turns": 2,
+        "reported_turns": 1,
+        "unknown_usage_turns": 1,
+        "tokens": {
+            "input": 100,
+            "output": 25,
+            "total": 125,
+            "cache_read": 10,
+            "cache_write": 4,
+            "reasoning": 8,
+        },
+    }]
+    serialized = json.dumps(report)
+    for private_value in ("goal-private", "session-private", "attempt-reported", "another-project"):
+        assert private_value not in serialized
+    assert before == after
+    outbox._connection.close()
+
+
+def test_missing_ledger_is_unavailable_and_not_a_zero_usage_claim(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _configure(home)
+    entry = _tool()
+
+    report = json.loads(entry.handler({}))
+
+    assert report == {"status": "unavailable", "reason": "usage_ledger_not_found"}
+    assert "turns" not in report
+    assert not (home / "curatormd").exists()
+
+
+def test_empty_ledger_reports_zero_turns_without_inventing_token_totals(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _configure(home)
+
+    from gateway.codex_outbox import CodexLifecycleOutbox
+
+    outbox = CodexLifecycleOutbox(profile_id="gptmd-coding")
+    entry = _tool()
+    report = json.loads(entry.handler({}))
+
+    assert report["status"] == "available"
+    assert report["turns"] == 0
+    assert report["reported_turns"] == 0
+    assert report["unknown_usage_turns"] == 0
+    assert set(report["tokens"].values()) == {None}
+    assert report["by_provider_model"] == []
+    outbox._connection.close()
+
+
+def test_unconfigured_or_invalid_project_id_cannot_select_a_project(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _configure(home, "../other")
+    (home / "curatormd").mkdir()
+    db_path = home / "curatormd" / "codex-outbox.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE project_usage_events (project_id TEXT, usage_status TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO project_usage_events VALUES ('other', 'reported')"
+        )
+    entry = _tool()
+
+    report = json.loads(entry.handler({}))
+
+    assert report == {"status": "not_configured", "reason": "configure_project_id"}

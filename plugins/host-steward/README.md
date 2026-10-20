@@ -1,7 +1,8 @@
 # Host Steward (Hermes Core)
 
-Host Steward is an opt-in, root-account-only observer for disk growth. It is
-separate from CuratorMD and from the existing `disk-cleanup` plugin.
+Host Steward is an opt-in Hermes Core account component for disk growth. It is
+separate from CuratorMD and from the existing `disk-cleanup` plugin. It never
+writes project knowledge.
 
 The initial component exposes two model tools:
 
@@ -10,13 +11,34 @@ The initial component exposes two model tools:
   stops at a bounded entry count and depth. A compact before/after snapshot is
   stored in Hermes plugin state.
 - `host_proposals` lists targets above their configured threshold with the
-  configured owner, symbolic managed-action id, reclaim estimate, impact, and
-  recovery path. It marks each proposal `review_required` and `executable: false`.
+  configured owner, registered managed-action id, reclaim estimate, impact,
+  recovery path, and inventory-manifest hash. It marks each proposal
+  `review_required` and `executable: false`.
+- `host_cleanup` runs only the registered `empty_configured_cache` action on
+  the exact configured directory, after the Hermes approval gate returns a
+  fresh `once` decision for that proposal and inventory hash. A plugin-owned
+  one-use receipt check independently rejects yolo/off-mode bypasses, remembered
+  session/permanent approvals, expired or replayed grants, changed inventory,
+  symlinks, special files, and unsupported action IDs. It uses bounded,
+  no-follow directory-descriptor operations; no shell or model-selected path is
+  accepted. The configured directory itself is retained while its contents are
+  removed.
+- `host_cleanup_receipts` exposes the latest 50 receipts from a bounded
+  200-record profile-local history. Receipts distinguish approved, rejected,
+  running, completed, verification-incomplete/failed, and partial-failure
+  outcomes. Free space is checked before and after. Configured systemd services
+  are checked with a fixed `systemctl is-active --quiet <validated-unit>` call;
+  no configured units leaves verification incomplete, not green.
+- `host_cleanup_reconcile` handles a receipt left `running` after an operator
+  confirms the original Hermes process has stopped. It changes that receipt to
+  `interrupted_requires_review` and never resumes or repeats deletion. The
+  operator must take fresh inventory and verify target contents, free space, and
+  service health; another cleanup requires a new proposal and fresh approval.
 
-There is deliberately no approval API, shell-command dispatch, or deletion
-executor in this increment. A model can inventory and propose, but cannot
-approve or clean up its own proposal. The plan's distinct human approval,
-managed action, post-action verification, and receipt gates remain open.
+The proposal generator cannot approve or execute its own proposal. The approval
+API does not expose an authenticated human subject to this plugin; receipts say
+so explicitly. Production account identity, host-owner attribution, live
+installation, and deployment recovery drills remain open gates.
 
 The plugin declines to register in named Hermes profiles under
 `~/.hermes/profiles/`; it belongs only to the Hermes Core account home. Keep it
@@ -37,13 +59,17 @@ plugins:
             owner: uv
             threshold_bytes: 1073741824
             expected_reclaim_bytes: 536870912
-            managed_action_id: uv_cache_prune
+            managed_action_id: empty_configured_cache
             service_impact: Cached packages may need to be fetched again.
             recovery_path: Re-run the project's uv sync or uv tool install.
 ```
 
-Treat the expected reclaim figure as an operator estimate, not a promise. The
-symbolic action id is descriptive only; this version never resolves or runs it.
-Never configure a project tree, secrets directory, or broad system root as a
-cleanup target. Keep the project-local `curatormd-v2` plugin and all project
-knowledge out of this account-level host component.
+Treat the expected reclaim figure as an operator estimate, not a promise.
+`managed_action_id` must currently be `empty_configured_cache`; unknown action
+names are rejected. Choose service units from a verified host inventory and
+describe impact/recovery accurately. With no service units configured, cleanup
+may run after approval but its receipt remains `verification_incomplete`, not
+green. Never configure a project tree, secrets
+directory, or broad system root as a cleanup target. Keep the project-local
+`curatormd-v2` plugin and all project knowledge out of this account-level host
+component. A successful local test does not enable cleanup on a real host.
