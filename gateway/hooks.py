@@ -14,7 +14,9 @@ Forum follow-ups pass ``message_thread_id=int(thread_id)``.
 """
 
 import asyncio
+import inspect
 import importlib.util
+import json
 import sys
 import threading
 from pathlib import Path
@@ -30,6 +32,94 @@ from gateway.codex_outbox import CodexLifecycleOutbox
 
 HOOKS_DIR = get_hermes_home() / "hooks"
 _HOOKS_DIR_AT_IMPORT = HOOKS_DIR
+
+
+class HookContext:
+    """Profile-scoped capabilities available to opt-in gateway hook handlers.
+
+    MCP access is granted per hook through ``hooks.entries.<name>.mcp_allowlist``
+    and remains default-deny. Trusted profile/session metadata is added only by
+    the existing MCP handler trust gate for opted-in local stdio servers.
+    """
+
+    def __init__(self, hook_name: str):
+        self.hook_name = hook_name
+
+    def call_mcp(
+        self,
+        server: str,
+        tool: str,
+        arguments: Optional[dict[str, Any]] = None,
+        timeout: float = 30,
+        *,
+        session_id: Optional[str] = None,
+        hermes_durable_event: bool = False,
+    ) -> dict[str, Any]:
+        """Call an allowlisted MCP server through Hermes' managed connection."""
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        hooks = config.get("hooks", {}) if isinstance(config, dict) else {}
+        entries = hooks.get("entries", {}) if isinstance(hooks, dict) else {}
+        entry = entries.get(self.hook_name, {}) if isinstance(entries, dict) else {}
+        allowlist = entry.get("mcp_allowlist") if isinstance(entry, dict) else None
+        allowed_servers = (
+            [item for item in allowlist if isinstance(item, str)]
+            if isinstance(allowlist, list)
+            else []
+        )
+        if server not in allowed_servers:
+            raise PermissionError(
+                f"Hook {self.hook_name!r} is not allowed to call MCP server {server!r}. "
+                f"Add it to hooks.entries.{self.hook_name}.mcp_allowlist in config.yaml."
+            )
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            timeout = 30.0
+        timeout = max(1.0, min(timeout, 600.0))
+        if session_id is not None and (
+            not isinstance(session_id, str)
+            or not session_id.strip()
+            or len(session_id) > 256
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in session_id)
+        ):
+            raise ValueError(
+                "session_id must be a non-empty, single-line value of at most 256 characters"
+            )
+        if type(hermes_durable_event) is not bool:
+            raise TypeError("hermes_durable_event must be a bool")
+        if hermes_durable_event and session_id is None:
+            raise ValueError("session_id is required for a durable Hermes event")
+
+        from tools.mcp_tool_handlers import _make_tool_handler
+
+        request_context: dict[str, Any] = {}
+        if session_id is not None:
+            request_context["session_id"] = session_id
+        if hermes_durable_event:
+            request_context["hermes_durable_event"] = True
+        raw = _make_tool_handler(server, tool, timeout)(
+            dict(arguments or {}), **request_context
+        )
+        if not isinstance(raw, str):
+            raw = "" if raw is None else str(raw)
+        truncated = len(raw) > 65536
+        if truncated:
+            raw = raw[:65536] + "… [truncated]"
+        try:
+            parsed: Any = json.loads(raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and "error" in parsed:
+            envelope: dict[str, Any] = {"ok": False, "error": parsed["error"]}
+        elif isinstance(parsed, dict) and "result" in parsed:
+            envelope = {"ok": True, "result": parsed["result"]}
+            if "structuredContent" in parsed:
+                envelope["structuredContent"] = parsed["structuredContent"]
+        else:
+            envelope = {"ok": True, "result": parsed if parsed is not None else raw}
+        return {**envelope, "truncated": True} if truncated else envelope
 
 
 def _resolve_hooks_dir() -> Path:
@@ -90,6 +180,7 @@ class HookRegistry:
     def __init__(self):
         self._handlers: dict[str, list[Callable]] = {}  # event_type -> handlers
         self._durable_handlers: dict[str, list[Callable]] = {}
+        self._hook_contexts: dict[int, HookContext] = {}
         self._loaded_hooks: list[dict] = []  # metadata for listing
         self._outbox: CodexLifecycleOutbox | None = None
         self._durable_drain_lock = asyncio.Lock()
@@ -118,6 +209,7 @@ class HookRegistry:
             if loaded is None:
                 continue
             hook_name, events, durable_events, handle_fn, description = loaded
+            self._hook_contexts[id(handle_fn)] = HookContext(hook_name)
             for event in events:
                 self._handlers.setdefault(event, []).append(handle_fn)
             for event in durable_events:
@@ -146,6 +238,23 @@ class HookRegistry:
         if ":" in event_type:
             handlers.extend(self._handlers.get(f"{event_type.split(':')[0]}:*", []))
         return handlers
+
+    def _invoke_handler(self, handler: Callable, event_type: str, context: dict[str, Any]):
+        """Pass the public hook capability only to handlers that declare ``ctx``."""
+        try:
+            parameters = inspect.signature(handler).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "ctx" in parameters:
+            hook_context = self._hook_contexts.get(id(handler))
+            if hook_context is None:
+                return handler(event_type, context)
+            return handler(
+                event_type,
+                context,
+                ctx=hook_context,
+            )
+        return handler(event_type, context)
 
     async def emit(self, event_type: str, context: Optional[dict[str, Any]] = None) -> None:
         """Fire all handlers for an event, discarding return values."""
@@ -180,7 +289,7 @@ class HookRegistry:
         matched_consumer = False
         for handler in handlers:
             try:
-                result = handler(event_type, context)
+                result = self._invoke_handler(handler, event_type, context)
                 result = await result if asyncio.iscoroutine(result) else result
                 if result is None:
                     continue
@@ -229,7 +338,7 @@ class HookRegistry:
             handlers = [fn for fn in handlers if id(fn) not in durable_ids]
         for fn in handlers:
             try:
-                result = fn(event_type, context)
+                result = self._invoke_handler(fn, event_type, context)
                 result = await result if asyncio.iscoroutine(result) else result  # sync or async handlers
                 if result is not None:
                     results.append(result)

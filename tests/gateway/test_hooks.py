@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from gateway.hooks import HookRegistry
+from gateway.hooks import HookContext, HookRegistry
 
 
 def _create_hook(hooks_dir, hook_name, events, handler_code):
@@ -55,6 +55,76 @@ class TestDiscoverAndLoad:
 
 
 class TestEmit:
+
+    @pytest.mark.asyncio
+    async def test_hook_receives_public_context_only_when_declared(self, tmp_path):
+        _create_hook(
+            tmp_path,
+            "ctx-hook",
+            '["codex:turn:start"]',
+            "seen = []\n"
+            "def handle(event_type, context, *, ctx):\n"
+            "    seen.append((event_type, ctx))\n"
+            "    return True\n",
+        )
+
+        reg = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+            reg.discover_and_load()
+        await reg.emit("codex:turn:start", {"session_id": "session-1"})
+
+        seen = reg._handlers["codex:turn:start"][0].__globals__["seen"]
+        assert len(seen) == 1
+        assert isinstance(seen[0][1], HookContext)
+        assert seen[0][1].hook_name == "ctx-hook"
+
+    def test_hook_context_call_mcp_uses_scoped_allowlist_and_host_request_context(self):
+        from tools import mcp_tool_handlers
+
+        call = {}
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "hooks": {"entries": {"curator": {"mcp_allowlist": ["curator-mcp"]}}}
+            },
+        ), patch.object(
+            mcp_tool_handlers,
+            "_make_tool_handler",
+            side_effect=lambda server, tool, timeout: lambda args, **kwargs: (
+                call.update(
+                    server=server,
+                    tool=tool,
+                    timeout=timeout,
+                    arguments=args,
+                    request_context=kwargs,
+                )
+                or '{"result": "receipt"}'
+            ),
+        ):
+            result = HookContext("curator").call_mcp(
+                "curator-mcp",
+                "hermes_codex_event",
+                {"event_id": "event-1"},
+                session_id="session-1",
+                hermes_durable_event=True,
+            )
+
+        assert result == {"ok": True, "result": "receipt"}
+        assert call == {
+            "server": "curator-mcp",
+            "tool": "hermes_codex_event",
+            "timeout": 30.0,
+            "arguments": {"event_id": "event-1"},
+            "request_context": {
+                "session_id": "session-1",
+                "hermes_durable_event": True,
+            },
+        }
+
+    def test_hook_context_mcp_is_default_deny(self):
+        with patch("hermes_cli.config.load_config", return_value={}):
+            with pytest.raises(PermissionError, match="hooks.entries.curator.mcp_allowlist"):
+                HookContext("curator").call_mcp("curator-mcp", "hermes_codex_event")
 
     @pytest.mark.asyncio
     async def test_emit_calls_async_handler(self, tmp_path):

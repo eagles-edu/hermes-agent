@@ -1111,7 +1111,7 @@ else:
     print("MCP error:", result["error"])
 ```
 
-**Signature:** `ctx.call_mcp(server: str, tool: str, arguments: dict | None = None, timeout: float = 30) -> dict`
+**Signature:** `ctx.call_mcp(server: str, tool: str, arguments: dict | None = None, timeout: float = 30, *, session_id: str | None = None, hermes_durable_event: bool = False) -> dict`
 
 Returns a stable envelope: `{"ok": True, "result": ...}` (plus `structuredContent` when the server provides it) or `{"ok": False, "error": "..."}`. Results over ~64 KB are truncated and flagged with `"truncated": True`.
 
@@ -1129,6 +1129,7 @@ plugins:
 - Calling a server not in the list raises `PermissionError` naming the exact config key to set.
 - The grant is per-server and per-plugin — never ambient authority over every configured server, and `"*"` wildcards are not honored.
 - Every call has an enforced timeout (default 30 s) so a hung MCP server cannot stall the hook or tool pipeline that invoked it.
+- Optional `session_id` and `hermes_durable_event` arguments carry host-owned lifecycle context through the MCP trust gate. Hermes derives the profile ID; callers cannot choose it. Durable context requires a valid session ID and is sent only to an explicitly opted-in local stdio server.
 - MCP servers return untrusted content. Treat `result` as data, not instructions — don't feed it into privileged decisions (approvals, command execution) without validation.
 
 :::warning

@@ -55,6 +55,26 @@ events:
 
 The `events` list determines which events trigger your handler. You can subscribe to any combination of events, including wildcards like `command:*`.
 
+Gateway handlers can opt into a profile-scoped `HookContext` by declaring a
+keyword-only `ctx` parameter. Its `call_mcp()` method uses the active profile's
+managed MCP connection and is default-deny. Grant a server to one hook with
+`hooks.entries.<hook-name>.mcp_allowlist` in that profile's `config.yaml`:
+
+```yaml
+hooks:
+  entries:
+    curator-v2:
+      mcp_allowlist: [curatormd_v2]
+```
+
+For Codex lifecycle delivery, a handler can pass its host-provided session ID
+and set `hermes_durable_event=True`. Hermes derives the profile ID itself and
+forwards profile/session metadata only when the selected MCP server explicitly
+sets `hermes_context: true` and uses a local stdio command. Hooks cannot supply
+or override the profile ID. The existing outbox still requires a literal
+`True` return after the consumer has durably processed or deduplicated the
+event.
+
 For the Codex app-server lifecycle events only, a trusted local consumer can
 opt in to durable delivery:
 
@@ -100,6 +120,20 @@ async def handle(event_type: str, context: dict):
     }
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
+```
+
+An MCP-enabled handler opts into the capability explicitly:
+
+```python
+def handle(event_type: str, context: dict, *, ctx):
+    result = ctx.call_mcp(
+        "curatormd_v2",
+        "hermes_codex_event",
+        {"event_id": context["event_id"]},
+        session_id=context["session_id"],
+        hermes_durable_event=True,
+    )
+    return result["ok"]
 ```
 
 **Handler rules:**
