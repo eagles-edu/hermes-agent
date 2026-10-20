@@ -316,7 +316,11 @@ def _manifest_metadata(relative_path: str, metadata: os.stat_result, kind: str) 
     }
 
 
-def _make_inventory(targets: list[dict[str, Any]], max_entries: int) -> dict[str, Any]:
+def _make_inventory(
+    targets: list[dict[str, Any]],
+    max_entries: int,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     observed_at = datetime.now(UTC).isoformat()
     target_results: list[dict[str, Any]] = []
     for target in targets:
@@ -327,7 +331,7 @@ def _make_inventory(targets: list[dict[str, Any]], max_entries: int) -> dict[str
             **_scan_directory(target["path"], max_entries),
         })
     usage = _disk_usage("/")
-    return {
+    inventory = {
         "observed_at": observed_at,
         "filesystem": {
             "path": "/",
@@ -336,6 +340,135 @@ def _make_inventory(targets: list[dict[str, Any]], max_entries: int) -> dict[str
             "free_bytes": usage.free,
         },
         "targets": target_results,
+    }
+    inventory["growth_attribution"] = _growth_attribution(inventory, previous)
+    return inventory
+
+
+def _complete_scan(row: dict[str, Any]) -> bool:
+    """Return whether one target's metadata scan can support attribution."""
+    return (
+        row.get("entry_limit_reached") is False
+        and row.get("depth_limit_reached") is False
+        and row.get("metadata_errors") == 0
+        and row.get("unsafe_entries") == 0
+    )
+
+
+def _valid_size(value: Any) -> bool:
+    """Accept a non-negative byte count, excluding booleans."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _target_owner_growth(
+    current_rows: list[Any], previous_rows: list[Any]
+) -> tuple[dict[str, int], bool]:
+    """Compare only complete, unchanged target bindings and aggregate by owner."""
+    current_by_id = {
+        row.get("id"): row for row in current_rows if isinstance(row, dict)
+    }
+    previous_by_id = {
+        row.get("id"): row for row in previous_rows if isinstance(row, dict)
+    }
+    complete = (
+        len(current_by_id) == len(current_rows)
+        and len(previous_by_id) == len(previous_rows)
+        and current_by_id.keys() == previous_by_id.keys()
+    )
+    owners: dict[str, int] = {}
+    paths: list[Path] = []
+    for target_id, row in current_by_id.items():
+        prior = previous_by_id.get(target_id)
+        if not isinstance(prior, dict):
+            complete = False
+            continue
+        path = row.get("path")
+        owner = row.get("owner")
+        if not isinstance(path, str) or not isinstance(owner, str):
+            complete = False
+            continue
+        target_path = Path(path)
+        if any(target_path == seen or target_path in seen.parents or seen in target_path.parents for seen in paths):
+            complete = False
+        paths.append(target_path)
+        if path != prior.get("path") or owner != prior.get("owner"):
+            complete = False
+            continue
+        current_bytes = row.get("allocated_bytes")
+        previous_bytes = prior.get("allocated_bytes")
+        if (
+            not _complete_scan(row)
+            or not _complete_scan(prior)
+            or not _valid_size(current_bytes)
+            or not _valid_size(previous_bytes)
+        ):
+            complete = False
+            continue
+        growth = max(0, current_bytes - previous_bytes)
+        if growth:
+            owners[owner] = owners.get(owner, 0) + growth
+    if not complete:
+        return {}, False
+    return owners, True
+
+
+def _growth_attribution(
+    current: dict[str, Any], previous: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Compare filesystem usage with complete, configured-owner target deltas."""
+    base = {
+        "scope": "configured_targets_only",
+        "configured_owner_growth_bytes": [],
+        "configured_target_coverage_complete": False,
+    }
+    if previous is None:
+        return {
+            **base,
+            "status": "baseline",
+            "filesystem_used_growth_bytes": None,
+            "unattributed_growth_estimate_bytes": None,
+        }
+
+    current_filesystem = current.get("filesystem")
+    previous_filesystem = previous.get("filesystem")
+    if not isinstance(current_filesystem, dict) or not isinstance(previous_filesystem, dict):
+        return {
+            **base,
+            "status": "incomplete",
+            "filesystem_used_growth_bytes": None,
+            "unattributed_growth_estimate_bytes": None,
+        }
+    current_used = current_filesystem.get("used_bytes")
+    previous_used = previous_filesystem.get("used_bytes")
+    if not _valid_size(current_used) or not _valid_size(previous_used):
+        return {
+            **base,
+            "status": "incomplete",
+            "filesystem_used_growth_bytes": None,
+            "unattributed_growth_estimate_bytes": None,
+        }
+
+    current_rows = current.get("targets")
+    previous_rows = previous.get("targets")
+    if not isinstance(current_rows, list) or not isinstance(previous_rows, list):
+        current_rows, previous_rows = [], []
+        coverage_complete = False
+        owner_growth: dict[str, int] = {}
+    else:
+        owner_growth, coverage_complete = _target_owner_growth(current_rows, previous_rows)
+
+    filesystem_growth = max(0, current_used - previous_used)
+    attributed_growth = min(filesystem_growth, sum(owner_growth.values()))
+    return {
+        "scope": "configured_targets_only",
+        "status": "measured" if coverage_complete else "partial",
+        "filesystem_used_growth_bytes": filesystem_growth,
+        "configured_owner_growth_bytes": [
+            {"owner": owner, "growth_bytes": growth}
+            for owner, growth in sorted(owner_growth.items())
+        ],
+        "unattributed_growth_estimate_bytes": filesystem_growth - attributed_growth,
+        "configured_target_coverage_complete": coverage_complete,
     }
 
 
@@ -574,9 +707,13 @@ def register(ctx: Any) -> None:
         except (TypeError, ValueError):
             max_entries = 20_000
         max_entries = min(_MAX_ENTRIES, max(1, max_entries))
-        inventory = _make_inventory(targets, max_entries)
         prior_state = ctx.state.get(_STATE_KEY, default={})
         previous = prior_state.get("latest") if isinstance(prior_state, dict) else None
+        inventory = _make_inventory(
+            targets,
+            max_entries,
+            previous if isinstance(previous, dict) else None,
+        )
         ctx.state.set(_STATE_KEY, {"previous": previous, "latest": inventory})
         proposals = _proposals(
             targets, inventory, previous if isinstance(previous, dict) else None

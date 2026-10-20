@@ -122,6 +122,96 @@ def test_inventory_and_proposal_are_observational_and_never_executable(
     assert registry.get_entry("host_execute", scope=manager.scope_key) is None
 
 
+def test_inventory_labels_filesystem_growth_outside_configured_targets(
+    steward_env, tmp_path, monkeypatch
+):
+    target_dir = tmp_path / "cache"
+    target_dir.mkdir()
+    (target_dir / "artifact.bin").write_bytes(b"unchanged")
+    _enable(steward_env, [_target(target_dir)])
+    manager, registry = _load_tools()
+    inventory = registry.get_entry("host_inventory", scope=manager.scope_key).handler
+    disk_samples = iter([
+        SimpleNamespace(total=100_000, used=40_000, free=60_000),
+        SimpleNamespace(total=100_000, used=70_000, free=30_000),
+    ])
+    monkeypatch.setitem(inventory.__globals__, "_disk_usage", lambda _path: next(disk_samples))
+
+    baseline = json.loads(inventory({}))
+    current = json.loads(inventory({}))
+
+    assert baseline["inventory"]["growth_attribution"]["status"] == "baseline"
+    attribution = current["inventory"]["growth_attribution"]
+    assert attribution["scope"] == "configured_targets_only"
+    assert attribution["status"] == "measured"
+    assert attribution["filesystem_used_growth_bytes"] == 30_000
+    assert attribution["configured_owner_growth_bytes"] == []
+    assert attribution["unattributed_growth_estimate_bytes"] == 30_000
+    assert attribution["configured_target_coverage_complete"] is True
+
+
+def test_inventory_splits_measured_owner_growth_from_unattributed_remainder(
+    steward_env, tmp_path, monkeypatch
+):
+    target_dir = tmp_path / "cache"
+    target_dir.mkdir()
+    cached_file = target_dir / "artifact.bin"
+    cached_file.write_bytes(b"a" * 512)
+    _enable(steward_env, [_target(target_dir)])
+    manager, registry = _load_tools()
+    inventory = registry.get_entry("host_inventory", scope=manager.scope_key).handler
+    disk_samples = iter([
+        SimpleNamespace(total=200_000, used=50_000, free=150_000),
+        SimpleNamespace(total=200_000, used=150_000, free=50_000),
+    ])
+    monkeypatch.setitem(inventory.__globals__, "_disk_usage", lambda _path: next(disk_samples))
+
+    baseline = json.loads(inventory({}))["inventory"]
+    cached_file.write_bytes(b"b" * 16_384)
+    current = json.loads(inventory({}))["inventory"]
+    target_growth = (
+        current["targets"][0]["allocated_bytes"]
+        - baseline["targets"][0]["allocated_bytes"]
+    )
+
+    attribution = current["growth_attribution"]
+    assert attribution["status"] == "measured"
+    assert attribution["configured_owner_growth_bytes"] == [
+        {"owner": "test-cache-owner", "growth_bytes": target_growth}
+    ]
+    assert attribution["filesystem_used_growth_bytes"] == 100_000
+    assert attribution["unattributed_growth_estimate_bytes"] == 100_000 - target_growth
+    assert attribution["configured_target_coverage_complete"] is True
+
+
+def test_inventory_with_incomplete_target_scan_does_not_attribute_owner_growth(
+    steward_env, tmp_path, monkeypatch
+):
+    target_dir = tmp_path / "cache"
+    target_dir.mkdir()
+    cached_file = target_dir / "artifact.bin"
+    cached_file.write_bytes(b"a" * 512)
+    (target_dir / "second.bin").write_bytes(b"another file")
+    _enable(steward_env, [_target(target_dir)], max_entries=1)
+    manager, registry = _load_tools()
+    inventory = registry.get_entry("host_inventory", scope=manager.scope_key).handler
+    disk_samples = iter([
+        SimpleNamespace(total=200_000, used=50_000, free=150_000),
+        SimpleNamespace(total=200_000, used=70_000, free=130_000),
+    ])
+    monkeypatch.setitem(inventory.__globals__, "_disk_usage", lambda _path: next(disk_samples))
+
+    inventory({})
+    cached_file.write_bytes(b"b" * 16_384)
+    current = json.loads(inventory({}))["inventory"]
+
+    attribution = current["growth_attribution"]
+    assert attribution["status"] == "partial"
+    assert attribution["configured_owner_growth_bytes"] == []
+    assert attribution["unattributed_growth_estimate_bytes"] == 20_000
+    assert attribution["configured_target_coverage_complete"] is False
+
+
 def test_cleanup_requires_exact_one_time_approval_and_writes_receipt(
     steward_env, tmp_path, monkeypatch
 ):
