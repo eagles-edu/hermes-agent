@@ -121,6 +121,45 @@ class TestTrustGateAtCallTime:
         )
         assert json.loads(raw) == {"result": "ok"}
 
+    def test_gateway_hook_public_context_reaches_mcp_with_hermes_derived_profile(
+        self, fake_session
+    ):
+        """Exercise the public hook capability through the managed MCP handler."""
+        from gateway.hooks import HookContext
+
+        _set_trust("srv", "trusted")
+        config = {
+            "hooks": {"entries": {"curator": {"mcp_allowlist": ["srv"]}}}
+        }
+        server_config = {
+            "srv": {"command": "curator", "hermes_context": True}
+        }
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "hermes_cli.mcp_config._get_mcp_servers", return_value=server_config
+        ), patch(
+            "hermes_constants.get_hermes_home", return_value="/profiles/alpha"
+        ), patch(
+            "hermes_constants.profile_name_for_home", return_value="alpha"
+        ):
+            result = HookContext("curator").call_mcp(
+                "srv",
+                "hermes_codex_event",
+                {"event_id": "event-1"},
+                session_id="session-1",
+                hermes_durable_event=True,
+            )
+
+        assert result == {"ok": True, "result": "ok"}
+        fake_session.call_tool.assert_awaited_once_with(
+            "hermes_codex_event",
+            arguments={"event_id": "event-1"},
+            meta={
+                "hermes/profile_id": "alpha",
+                "hermes/session_id": "session-1",
+                "hermes/durable_event": True,
+            },
+        )
+
     def test_successful_goal_activation_persists_profile_local_binding(self, tmp_path):
         """Only explicit active-goal MCP results bind the host session to a project goal."""
         from gateway.codex_outbox import CodexLifecycleOutbox

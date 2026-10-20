@@ -43,7 +43,6 @@ def _patch_handler(monkeypatch, response: str, captured: dict | None = None):
         def _handler(args, **kwargs):
             if captured is not None:
                 captured["args"] = args
-                captured["request_context"] = kwargs
             return response
 
         return _handler
@@ -130,54 +129,6 @@ def test_allowed_call_routes_through_existing_handler(monkeypatch):
     assert captured["tool"] == "create_issue"
     assert captured["args"] == {"title": "bug"}
     assert result == {"ok": True, "result": "issue #7 created"}
-
-
-def test_call_mcp_forwards_bounded_durable_context(monkeypatch):
-    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["curator"]}})
-    captured = {}
-    _patch_handler(monkeypatch, '{"result": "accepted"}', captured)
-
-    result = _make_ctx().call_mcp(
-        "curator",
-        "hermes_codex_event",
-        {"event_id": "event-1"},
-        session_id="session-1",
-        hermes_durable_event=True,
-    )
-
-    assert result == {"ok": True, "result": "accepted"}
-    assert captured["request_context"] == {
-        "session_id": "session-1",
-        "hermes_durable_event": True,
-    }
-
-
-@pytest.mark.parametrize(
-    "session_id",
-    ["", " \t", "x\ny", "x\r", "x" * 257],
-)
-def test_call_mcp_rejects_invalid_session_context(monkeypatch, session_id):
-    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["curator"]}})
-    called = {}
-    _patch_handler(monkeypatch, '{"result": "unused"}', called)
-
-    with pytest.raises(ValueError, match="session_id"):
-        _make_ctx().call_mcp("curator", "hermes_codex_event", session_id=session_id)
-
-    assert "args" not in called
-
-
-def test_call_mcp_requires_session_for_durable_event(monkeypatch):
-    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["curator"]}})
-    called = {}
-    _patch_handler(monkeypatch, '{"result": "unused"}', called)
-
-    with pytest.raises(ValueError, match="session_id is required"):
-        _make_ctx().call_mcp(
-            "curator", "hermes_codex_event", hermes_durable_event=True
-        )
-
-    assert "args" not in called
 
 
 def test_error_result_maps_to_ok_false(monkeypatch):

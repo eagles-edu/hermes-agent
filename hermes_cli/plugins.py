@@ -502,15 +502,11 @@ class PluginContext:
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[dict[str, Any]] = None,
         timeout: float = 30,
-        *, session_id: Optional[str] = None, hermes_durable_event: bool = False,
     ) -> dict[str, Any]:
         """Call ``tool`` on MCP ``server`` synchronously through :mod:`tools.mcp_tool`'s native client
         (same trust gates, breaker, reconnect — never a parallel connection). Servers not in
         ``plugins.entries.<plugin_id>.mcp_allowlist`` raise ``PermissionError`` (default-deny). ``timeout``
-        clamps to 1–600s; results over ~64KB are truncated with a marker. Optional
-        ``session_id`` and ``hermes_durable_event`` pass host-owned context through
-        the existing trust gate. The profile identity is always derived by Hermes;
-        plugins cannot supply or override it.
+        clamps to 1–600s; results over ~64KB are truncated with a marker.
 
         This is a per-server grant, deliberately not ambient authority over every configured server.
         TODO(#64228): swap the per-server allowlist for the declared capability model once it lands
@@ -528,24 +524,8 @@ class PluginContext:
         except (TypeError, ValueError):
             timeout = 30.0
         timeout = max(1.0, min(timeout, 600.0))
-        if session_id is not None and (
-            not isinstance(session_id, str)
-            or not session_id.strip()
-            or len(session_id) > 256
-            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in session_id)
-        ):
-            raise ValueError("session_id must be a non-empty, single-line value of at most 256 characters")
-        if type(hermes_durable_event) is not bool:
-            raise TypeError("hermes_durable_event must be a bool")
-        if hermes_durable_event and session_id is None:
-            raise ValueError("session_id is required for a durable Hermes event")
         from tools.mcp_tool_handlers import _make_tool_handler
-        request_context: dict[str, Any] = {}
-        if session_id is not None:
-            request_context["session_id"] = session_id
-        if hermes_durable_event:
-            request_context["hermes_durable_event"] = True
-        raw = _make_tool_handler(server, tool, timeout)(dict(arguments or {}), **request_context)
+        raw = _make_tool_handler(server, tool, timeout)(dict(arguments or {}))
         logger.debug("Plugin %s called MCP %s/%s (timeout=%ss, %d chars returned)",
                      self.manifest.name, server, tool, timeout, len(raw or ""))
         return self._mcp_envelope(raw)
