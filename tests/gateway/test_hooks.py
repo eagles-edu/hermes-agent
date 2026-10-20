@@ -1,6 +1,9 @@
 """Tests for gateway/hooks.py — event hook system."""
 
-from unittest.mock import patch
+import asyncio
+import threading
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -239,8 +242,37 @@ class TestEmit:
 
     @pytest.mark.asyncio
     async def test_codex_durable_delivery_uses_managed_mcp_hook_context(self, tmp_path):
-        """A persisted Codex event reaches the allowlisted MCP route before ack."""
-        from tools import mcp_tool_handlers
+        """A persisted Codex event reaches Hermes' managed MCP session before ack."""
+        from hermes_constants import get_hermes_home, profile_name_for_home
+        from tools import mcp_tool
+
+        mcp_result = SimpleNamespace(
+            content=[],
+            isError=False,
+            structuredContent={"status": "processed"},
+            _meta=None,
+        )
+        session = MagicMock()
+        session.call_tool = AsyncMock(return_value=mcp_result)
+        server = SimpleNamespace(session=session, _rpc_lock=None)
+
+        def run_on_mcp_loop(coro_or_factory, timeout=30):
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(target=loop.run_forever)
+            thread.start()
+
+            async def run_call():
+                if server._rpc_lock is None:
+                    server._rpc_lock = asyncio.Lock()
+                return await coro
+
+            try:
+                return asyncio.run_coroutine_threadsafe(run_call(), loop).result(timeout)
+            finally:
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join()
+                loop.close()
 
         hook_dir = tmp_path / "curator"
         hook_dir.mkdir()
@@ -250,6 +282,7 @@ class TestEmit:
             "durable_events: ['codex:turn:start']\n"
         )
         (hook_dir / "handler.py").write_text(
+            "observed = []\n"
             "def handle(event_type, context, *, ctx):\n"
             "    response = ctx.call_mcp(\n"
             "        'curator-mcp', 'hermes_codex_event',\n"
@@ -261,19 +294,11 @@ class TestEmit:
             "         'context': {'attempt_id': context['attempt_id'],\n"
             "                     'session_id': context['session_id']}},\n"
             "        session_id=context['session_id'], hermes_durable_event=True)\n"
+            "    observed.append(response)\n"
             "    receipt = response.get('result', {})\n"
             "    return response.get('ok') is True and receipt.get('status') in {\n"
             "        'processed', 'duplicate'}\n"
         )
-
-        calls = []
-
-        def make_handler(server, tool, timeout):
-            def invoke(arguments, **request_context):
-                calls.append((server, tool, timeout, arguments, request_context))
-                return '{"result":{"status":"processed"}}'
-
-            return invoke
 
         registry = HookRegistry()
         with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(registry):
@@ -285,7 +310,17 @@ class TestEmit:
                     "entries": {"curator": {"mcp_allowlist": ["curator-mcp"]}}
                 }
             },
-        ), patch.object(mcp_tool_handlers, "_make_tool_handler", side_effect=make_handler):
+        ), patch(
+            "hermes_cli.mcp_config._get_mcp_servers",
+            return_value={
+                "curator-mcp": {
+                    "command": "curator-mcp",
+                    "hermes_context": True,
+                }
+            },
+        ), patch.dict(mcp_tool._servers, {"curator-mcp": server}), patch(
+            "tools.mcp_tool_loop._run_on_mcp_loop", side_effect=run_on_mcp_loop
+        ), patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             assert registry._outbox is not None
             assert registry._outbox.bind_goal("project-1", "session-1", "goal-1")
             event = registry.queue_durable_event(
@@ -300,16 +335,16 @@ class TestEmit:
             assert event is not None
             assert "model" not in event["context"]
             assert "cwd" not in event["context"]
-            assert await registry.emit_durable(event)
+            delivered = await registry.emit_durable(event)
+            observed = registry._durable_handlers["codex:turn:start"][0].__globals__["observed"]
+            assert observed and observed[0].get("ok") is True, observed
+            assert delivered
             assert registry._outbox.pending() == []
 
-        assert len(calls) == 1
-        server, tool, timeout, arguments, request_context = calls[0]
-        assert (server, tool, timeout) == (
-            "curator-mcp",
-            "hermes_codex_event",
-            30.0,
-        )
+        session.call_tool.assert_awaited_once()
+        tool, call_kwargs = session.call_tool.await_args.args[0], session.call_tool.await_args.kwargs
+        assert tool == "hermes_codex_event"
+        arguments = call_kwargs["arguments"]
         assert arguments["project_id"] == "project-1"
         assert arguments["goal_id"] == "goal-1"
         assert arguments["event_id"] == event["event_id"]
@@ -318,9 +353,10 @@ class TestEmit:
             "attempt_id": "attempt-1",
             "session_id": "session-1",
         }
-        assert request_context == {
-            "session_id": "session-1",
-            "hermes_durable_event": True,
+        assert call_kwargs["meta"] == {
+            "hermes/profile_id": profile_name_for_home(get_hermes_home()),
+            "hermes/session_id": "session-1",
+            "hermes/durable_event": True,
         }
         assert registry._outbox is not None
         registry._outbox.close()
