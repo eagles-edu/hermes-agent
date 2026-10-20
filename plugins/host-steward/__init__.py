@@ -328,6 +328,7 @@ def _make_inventory(
             "id": target["id"],
             "path": str(target["path"]),
             "owner": target["owner"],
+            "service_units": target["service_units"],
             **_scan_directory(target["path"], max_entries),
         })
     usage = _disk_usage("/")
@@ -384,14 +385,25 @@ def _target_owner_growth(
             continue
         path = row.get("path")
         owner = row.get("owner")
-        if not isinstance(path, str) or not isinstance(owner, str):
+        service_units = row.get("service_units")
+        if (
+            not isinstance(path, str)
+            or not isinstance(owner, str)
+            or not isinstance(service_units, list)
+            or any(not isinstance(unit, str) for unit in service_units)
+            or len(set(service_units)) != len(service_units)
+        ):
             complete = False
             continue
         target_path = Path(path)
         if any(target_path == seen or target_path in seen.parents or seen in target_path.parents for seen in paths):
             complete = False
         paths.append(target_path)
-        if path != prior.get("path") or owner != prior.get("owner"):
+        if (
+            path != prior.get("path")
+            or owner != prior.get("owner")
+            or service_units != prior.get("service_units")
+        ):
             complete = False
             continue
         current_bytes = row.get("allocated_bytes")
@@ -419,6 +431,7 @@ def _growth_attribution(
     base = {
         "scope": "configured_targets_only",
         "configured_owner_growth_bytes": [],
+        "configured_service_target_growth_bytes": [],
         "configured_target_coverage_complete": False,
     }
     if previous is None:
@@ -459,6 +472,25 @@ def _growth_attribution(
 
     filesystem_growth = max(0, current_used - previous_used)
     attributed_growth = min(filesystem_growth, sum(owner_growth.values()))
+    service_target_growth = []
+    if coverage_complete:
+        previous_by_id = {
+            row["id"]: row for row in previous_rows if isinstance(row, dict)
+        }
+        for row in current_rows:
+            service_units = row["service_units"]
+            growth = max(
+                0,
+                row["allocated_bytes"]
+                - previous_by_id[row["id"]]["allocated_bytes"],
+            )
+            if growth and service_units:
+                service_target_growth.append({
+                    "target_id": row["id"],
+                    "owner": row["owner"],
+                    "service_units": service_units,
+                    "growth_bytes": growth,
+                })
     return {
         "scope": "configured_targets_only",
         "status": "measured" if coverage_complete else "partial",
@@ -467,6 +499,7 @@ def _growth_attribution(
             {"owner": owner, "growth_bytes": growth}
             for owner, growth in sorted(owner_growth.items())
         ],
+        "configured_service_target_growth_bytes": service_target_growth,
         "unattributed_growth_estimate_bytes": filesystem_growth - attributed_growth,
         "configured_target_coverage_complete": coverage_complete,
     }

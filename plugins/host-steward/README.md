@@ -17,7 +17,12 @@ The initial component exposes two model tools:
   target coverage is marked partial and contributes no owner attribution;
   overlapping target paths also produce partial coverage. The comparison
   covers configured target paths only and does not identify which unconfigured
-  path caused a filesystem delta.
+  path caused a filesystem delta. For a stable, complete target it also reports
+  the configured service-unit names associated with that target's positive
+  allocated-byte growth. This records operator-supplied target metadata; it does
+  not establish that a named service caused the writes. Targets outside the
+  configured inventory remain unattributed, and a changed service binding makes
+  the comparison partial.
 - `host_proposals` lists targets above their configured threshold with the
   configured owner, registered managed-action id, reclaim estimate, impact,
   recovery path, and inventory-manifest hash. It marks each proposal
