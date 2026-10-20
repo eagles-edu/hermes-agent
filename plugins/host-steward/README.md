@@ -14,9 +14,10 @@ The initial component exposes two model tools:
   unchanged, non-overlapping configured targets. It groups measured target
   growth by configured owner and labels the remainder as an unattributed
   growth estimate. The first observation is a baseline; incomplete or changed
-  target coverage is marked partial and contributes no owner attribution. The
-  comparison covers configured target paths only and does not identify which
-  unconfigured path caused a filesystem delta.
+  target coverage is marked partial and contributes no owner attribution;
+  overlapping target paths also produce partial coverage. The comparison
+  covers configured target paths only and does not identify which unconfigured
+  path caused a filesystem delta.
 - `host_proposals` lists targets above their configured threshold with the
   configured owner, registered managed-action id, reclaim estimate, impact,
   recovery path, and inventory-manifest hash. It marks each proposal

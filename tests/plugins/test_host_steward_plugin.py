@@ -212,6 +212,40 @@ def test_inventory_with_incomplete_target_scan_does_not_attribute_owner_growth(
     assert attribution["configured_target_coverage_complete"] is False
 
 
+def test_inventory_with_overlapping_targets_marks_attribution_partial(
+    steward_env, tmp_path, monkeypatch
+):
+    parent = tmp_path / "cache"
+    nested = parent / "nested"
+    nested.mkdir(parents=True)
+    cached_file = nested / "artifact.bin"
+    cached_file.write_bytes(b"a" * 512)
+    _enable(
+        steward_env,
+        [
+            _target(parent, id="parent-cache", owner="parent-owner"),
+            _target(nested, id="nested-cache", owner="nested-owner"),
+        ],
+    )
+    manager, registry = _load_tools()
+    inventory = registry.get_entry("host_inventory", scope=manager.scope_key).handler
+    disk_samples = iter([
+        SimpleNamespace(total=200_000, used=50_000, free=150_000),
+        SimpleNamespace(total=200_000, used=70_000, free=130_000),
+    ])
+    monkeypatch.setitem(inventory.__globals__, "_disk_usage", lambda _path: next(disk_samples))
+
+    inventory({})
+    cached_file.write_bytes(b"b" * 16_384)
+    current = json.loads(inventory({}))["inventory"]
+
+    attribution = current["growth_attribution"]
+    assert attribution["status"] == "partial"
+    assert attribution["configured_owner_growth_bytes"] == []
+    assert attribution["unattributed_growth_estimate_bytes"] == 20_000
+    assert attribution["configured_target_coverage_complete"] is False
+
+
 def test_cleanup_requires_exact_one_time_approval_and_writes_receipt(
     steward_env, tmp_path, monkeypatch
 ):
