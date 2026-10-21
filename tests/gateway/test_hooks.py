@@ -101,7 +101,7 @@ class TestEmit:
                     arguments=args,
                     request_context=kwargs,
                 )
-                or '{"result": "receipt"}'
+                or '{"result": "receipt", "hermes_goal_binding": "bound"}'
             ),
         ):
             result = HookContext("curator").call_mcp(
@@ -112,7 +112,11 @@ class TestEmit:
                 hermes_durable_event=True,
             )
 
-        assert result == {"ok": True, "result": "receipt"}
+        assert result == {
+            "ok": True,
+            "result": "receipt",
+            "hermes_goal_binding": "bound",
+        }
         assert call == {
             "server": "curator-mcp",
             "tool": "hermes_codex_event",
@@ -341,8 +345,22 @@ class TestEmit:
             assert delivered
             assert registry._outbox.pending() == []
 
-        session.call_tool.assert_awaited_once()
-        tool, call_kwargs = session.call_tool.await_args.args[0], session.call_tool.await_args.kwargs
+            retry_event = registry.queue_durable_event(
+                "codex:turn:start",
+                {"attempt_id": "attempt-2", "session_id": "session-1"},
+            )
+            assert retry_event is not None
+            mcp_result.structuredContent = {"status": "queued"}
+            assert not await registry.emit_durable(retry_event)
+            assert registry._outbox.pending() == [retry_event]
+
+            mcp_result.structuredContent = {"status": "duplicate"}
+            assert await registry.emit_durable(retry_event)
+            assert registry._outbox.pending() == []
+
+        assert session.call_tool.await_count == 3
+        first_call = session.call_tool.await_args_list[0]
+        tool, call_kwargs = first_call.args[0], first_call.kwargs
         assert tool == "hermes_codex_event"
         arguments = call_kwargs["arguments"]
         assert arguments["project_id"] == "project-1"
@@ -358,6 +376,11 @@ class TestEmit:
             "hermes/session_id": "session-1",
             "hermes/durable_event": True,
         }
+        retry_arguments = [call.kwargs["arguments"] for call in session.call_tool.await_args_list[1:]]
+        assert [call["event_id"] for call in retry_arguments] == [
+            retry_event["event_id"],
+            retry_event["event_id"],
+        ]
         assert registry._outbox is not None
         registry._outbox.close()
 

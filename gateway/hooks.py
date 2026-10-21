@@ -117,6 +117,9 @@ class HookContext:
             envelope = {"ok": True, "result": parsed["result"]}
             if "structuredContent" in parsed:
                 envelope["structuredContent"] = parsed["structuredContent"]
+            binding = parsed.get("hermes_goal_binding")
+            if binding in {"bound", "not_recorded"}:
+                envelope["hermes_goal_binding"] = binding
         else:
             envelope = {"ok": True, "result": parsed if parsed is not None else raw}
         return {**envelope, "truncated": True} if truncated else envelope

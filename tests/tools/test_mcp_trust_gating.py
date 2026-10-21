@@ -205,6 +205,66 @@ class TestTrustGateAtCallTime:
         assert len(event["source_id"]) == len("hermes-") + 64
         outbox.close()
 
+    def test_public_hook_call_returns_only_after_durable_goal_binding(
+        self, tmp_path, fake_session
+    ):
+        """Compose HookContext, the managed MCP handler, and the profile outbox."""
+        from gateway.codex_outbox import CodexLifecycleOutbox
+        from gateway.hooks import HookContext
+
+        home = tmp_path / "profiles" / "renew-ssl-coding"
+        _set_trust("srv", "trusted")
+        hook_config = {
+            "hooks": {"entries": {"curator": {"mcp_allowlist": ["srv"]}}}
+        }
+        mcp_config = {
+            "srv": {
+                "command": "curatormd-v2-mcp",
+                "hermes_context": True,
+                "hermes_project_id": "vhost-manager-alpha",
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=hook_config), patch(
+            "hermes_cli.mcp_config._get_mcp_servers", return_value=mcp_config
+        ), patch("hermes_constants.get_hermes_home", return_value=home), patch(
+            "hermes_constants.profile_name_for_home", return_value="renew-ssl-coding"
+        ):
+            result = HookContext("curator").call_mcp(
+                "srv",
+                "goal_activate",
+                {"goal_id": "vhost-goal-1"},
+                session_id="host-session-1",
+            )
+
+        assert result == {
+            "ok": True,
+            "result": "ok",
+            "hermes_goal_binding": "bound",
+        }
+        fake_session.call_tool.assert_awaited_once_with(
+            "goal_activate",
+            arguments={"goal_id": "vhost-goal-1"},
+            meta={
+                "hermes/profile_id": "renew-ssl-coding",
+                "hermes/session_id": "host-session-1",
+            },
+        )
+
+        outbox = CodexLifecycleOutbox(
+            home / "curatormd" / "codex-outbox.sqlite3",
+            profile_id="renew-ssl-coding",
+        )
+        try:
+            event = outbox.enqueue(
+                "codex:turn:start",
+                {"attempt_id": "attempt-1", "session_id": "host-session-1"},
+            )
+            assert event is not None
+            assert event["project_id"] == "vhost-manager-alpha"
+            assert event["goal_id"] == "vhost-goal-1"
+        finally:
+            outbox.close()
+
     def test_hermes_request_context_requires_explicit_local_stdio_opt_in(self):
         """Remote or non-opted-in MCP servers never receive profile/session metadata."""
         from tools.mcp_tool_handlers import _trusted_hermes_request_meta

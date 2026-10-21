@@ -122,6 +122,39 @@ def test_inventory_and_proposal_are_observational_and_never_executable(
     assert registry.get_entry("host_execute", scope=manager.scope_key) is None
 
 
+def test_root_host_steward_registers_only_host_tools_and_keeps_project_knowledge(
+    steward_env, tmp_path
+):
+    """Keep the account-level host plugin outside project knowledge tools."""
+    project_history = tmp_path / "consumer" / "persistence" / "HISTORY.md"
+    project_history.parent.mkdir(parents=True)
+    project_history.write_text("# Consumer facts\n", encoding="utf-8")
+    expected_tools = {
+        "host_inventory",
+        "host_proposals",
+        "host_cleanup",
+        "host_cleanup_receipts",
+        "host_cleanup_reconcile",
+    }
+    _enable(steward_env, [])
+    manager, registry = _load_tools()
+
+    loaded = manager._plugins["host-steward"]
+    assert set(loaded.manifest.provides_tools) == expected_tools
+    assert set(loaded.tools_registered) == expected_tools
+    assert all(
+        registry.get_entry(name, scope=manager.scope_key).toolset == "host_steward"
+        for name in expected_tools
+    )
+    for name in expected_tools - {"host_cleanup"}:
+        entry = registry.get_entry(name, scope=manager.scope_key)
+        assert entry is not None
+        entry.handler({})
+
+    assert project_history.read_text(encoding="utf-8") == "# Consumer facts\n"
+    assert not (steward_env / "curatormd").exists()
+
+
 def test_inventory_labels_filesystem_growth_outside_configured_targets(
     steward_env, tmp_path, monkeypatch
 ):
@@ -290,6 +323,9 @@ def test_cleanup_requires_exact_one_time_approval_and_writes_receipt(
     steward_env, tmp_path, monkeypatch
 ):
     target_dir = tmp_path / "cache"
+    project_history = tmp_path / "consumer" / "persistence" / "HISTORY.md"
+    project_history.parent.mkdir(parents=True)
+    project_history.write_text("# Consumer facts\n", encoding="utf-8")
     nested = target_dir / "nested"
     nested.mkdir(parents=True)
     cached_file = nested / "artifact.bin"
@@ -360,6 +396,7 @@ def test_cleanup_requires_exact_one_time_approval_and_writes_receipt(
     )
     assert receipts["retained_count"] == 1
     assert receipts["receipts"][0]["decision"] == "approved_once"
+    assert project_history.read_text(encoding="utf-8") == "# Consumer facts\n"
     replayed = json.loads(cleanup(modified))
     assert replayed["status"] == "blocked"
     assert not target_dir.joinpath("nested").exists()

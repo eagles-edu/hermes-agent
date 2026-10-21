@@ -10,7 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from functools import partial
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from hermes_platform import declaration
 from tools.registry import invalidate_check_fn_cache, tool_error
@@ -57,7 +57,9 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
     return _core._tool_read_only_hints.get(_resolve_server_key(server_name), {}).get(tool_name) is True
 
 
-def _trusted_hermes_request_meta(server_name: str, kwargs: dict) -> Optional[dict[str, str]]:
+def _trusted_hermes_request_meta(
+    server_name: str, kwargs: dict
+) -> Optional[dict[str, Any]]:
     """Return host-owned profile/session context only for explicitly opted-in MCP servers.
 
     The values are carried in MCP request metadata, never model-authored tool arguments. This is
@@ -452,7 +454,12 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
 
 
 async def _call_tool_racing_stdio_death(
-    server, server_name: str, tool_name: str, args: dict, *, meta: Optional[dict[str, str]] = None
+    server,
+    server_name: str,
+    tool_name: str,
+    args: dict,
+    *,
+    meta: Optional[dict[str, Any]] = None,
 ):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
