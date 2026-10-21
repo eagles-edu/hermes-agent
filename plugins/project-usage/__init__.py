@@ -17,8 +17,12 @@ PROJECT_USAGE = {
     "name": "project_usage",
     "description": (
         "Read aggregate token usage for the one project ID configured in this Hermes profile. "
-        "The local ledger covers Codex app-server turns with explicit project/goal bindings only; "
-        "it does not include other providers or expose session and goal identifiers."
+        "The local ledger covers Codex app-server turns and Hermes provider API turns with "
+        "explicit project/goal bindings; auxiliary calls outside the active-turn callback, "
+        "attempts without a returned response, and unbound sessions are excluded. "
+        "The response marks this coverage partial even if every captured turn has reported tokens. "
+        "Token totals may already include cache buckets; do not add totals to input/cache values. "
+        "It does not expose session or goal identifiers."
     ),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
@@ -66,21 +70,34 @@ def _read_usage(project_id: str) -> dict[str, Any]:
         required = {
             "project_id", "provider", "model", "usage_status", "input_tokens",
             "output_tokens", "total_tokens", "cache_read_tokens", "cache_write_tokens",
-            "reasoning_tokens",
+            "reasoning_tokens", "turn_id", "usage_source",
         }
         if not required.issubset(columns):
             return {"status": "unavailable", "reason": "usage_ledger_schema_unavailable"}
 
         totals = connection.execute(
-            """SELECT COUNT(*), SUM(usage_status = 'reported'),
-                      SUM(usage_status = 'unknown'), SUM(input_tokens), SUM(output_tokens),
-                      SUM(total_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens),
-                      SUM(reasoning_tokens)
-               FROM project_usage_events WHERE project_id = ?""",
-            (project_id,),
+            """WITH turn_state AS (
+                   SELECT turn_id, MAX(usage_status = 'unknown') AS unknown_usage
+                   FROM project_usage_events WHERE project_id = ? GROUP BY turn_id
+               ), token_totals AS (
+                   SELECT SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+                          SUM(total_tokens) AS total_tokens,
+                          SUM(cache_read_tokens) AS cache_read_tokens,
+                          SUM(cache_write_tokens) AS cache_write_tokens,
+                          SUM(reasoning_tokens) AS reasoning_tokens
+                   FROM project_usage_events WHERE project_id = ?
+               )
+               SELECT (SELECT COUNT(*) FROM turn_state),
+                      (SELECT SUM(unknown_usage = 0) FROM turn_state),
+                      (SELECT SUM(unknown_usage = 1) FROM turn_state),
+                      token_totals.input_tokens, token_totals.output_tokens,
+                      token_totals.total_tokens, token_totals.cache_read_tokens,
+                      token_totals.cache_write_tokens, token_totals.reasoning_tokens
+               FROM token_totals""",
+            (project_id, project_id),
         ).fetchone()
         model_rows = connection.execute(
-            """SELECT provider, model, usage_status, COUNT(*), SUM(input_tokens),
+            """SELECT provider, model, usage_status, COUNT(DISTINCT turn_id), SUM(input_tokens),
                       SUM(output_tokens), SUM(total_tokens), SUM(cache_read_tokens),
                       SUM(cache_write_tokens), SUM(reasoning_tokens)
                FROM project_usage_events WHERE project_id = ?
@@ -88,6 +105,14 @@ def _read_usage(project_id: str) -> dict[str, Any]:
                ORDER BY provider, model, usage_status LIMIT ?""",
             (project_id, _MAX_MODEL_ROWS + 1),
         ).fetchall()
+        sources = [
+            row[0] for row in connection.execute(
+                "SELECT DISTINCT usage_source FROM project_usage_events "
+                "WHERE project_id = ? AND usage_source IN ('codex_app_server', 'hermes_agent_api') "
+                "ORDER BY usage_source",
+                (project_id,),
+            ).fetchall()
+        ]
         models: dict[tuple[str, str], dict[str, Any]] = {}
         for row in model_rows[:_MAX_MODEL_ROWS]:
             provider, model, usage_status, turns, *sums = row
@@ -121,10 +146,23 @@ def _read_usage(project_id: str) -> dict[str, Any]:
         return {
             "status": "available",
             "project_id": project_id,
-            "coverage": "Codex app-server turns with explicit project and goal bindings only",
+            "coverage": (
+                "bound Codex app-server and Hermes provider API turns, including auxiliary "
+                "responses with usage in the active turn; unbound sessions, auxiliary calls "
+                "outside that context, and attempts without a response are excluded"
+            ),
+            "sources": sources,
             "turns": int(totals[0] or 0),
             "reported_turns": int(totals[1] or 0),
             "unknown_usage_turns": int(totals[2] or 0),
+            # ``tokens_complete`` describes captured rows, not the project-wide
+            # coverage that remains partial while known call classes are excluded.
+            "coverage_complete": False,
+            "coverage_exclusions": [
+                "auxiliary_calls_outside_active_turn_context",
+                "auxiliary_attempts_without_response",
+                "unbound_sessions",
+            ],
             "tokens": {
                 "input": _sum_or_none(totals[3]),
                 "output": _sum_or_none(totals[4]),
@@ -133,6 +171,7 @@ def _read_usage(project_id: str) -> dict[str, Any]:
                 "cache_write": _sum_or_none(totals[7]),
                 "reasoning": _sum_or_none(totals[8]),
             },
+            "tokens_complete": int(totals[2] or 0) == 0,
             "by_provider_model": list(models.values()),
             "provider_model_groups_truncated": len(model_rows) > _MAX_MODEL_ROWS,
         }

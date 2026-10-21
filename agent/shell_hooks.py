@@ -377,7 +377,7 @@ def _parse_hooks(hooks_cfg: Any) -> tuple[list[ShellHookSpec], bool]:
     specs: list[ShellHookSpec] = []
     complete = True
     for event_name, entries in hooks_cfg.items():
-        if event_name in ("output_spill", "outbound"):  # reserved non-event sub-sections under `hooks:`
+        if event_name in ("output_spill", "outbound", "entries"):  # reserved non-event sub-sections under `hooks:`
             continue
         if event_name in SHELL_UNSUPPORTED_HOOKS:  # _parse_response has no channel for these directives — refuse loudly
             logger.warning("hook event %r is Python-plugin-only: shell hooks cannot return its directive, "

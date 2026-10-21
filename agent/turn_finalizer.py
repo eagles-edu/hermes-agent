@@ -522,6 +522,18 @@ def apply_llm_output_transform(
     return final_response, transformed, pre_transform
 
 
+def _attach_profile_usage(result: dict[str, Any], agent: Any, turn_id: str) -> None:
+    """Attach private local-usage fields for the Gateway writer to consume."""
+    from agent.turn_usage import profile_usage_snapshot
+
+    groups = profile_usage_snapshot(agent, turn_id)
+    if groups:
+        # Consumed only by Gateway's local usage ledger writer. These private
+        # counters are deliberately excluded from hook contexts and Curator events.
+        result["_profile_usage_turn_id"] = turn_id
+        result["_profile_usage_groups"] = groups
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -719,6 +731,7 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    _attach_profile_usage(result, agent, turn_id)
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True; also stamp `error` so the gateway

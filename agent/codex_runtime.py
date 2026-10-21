@@ -28,6 +28,9 @@ _codex_watchdog_state_var: contextvars.ContextVar[Any | None] = contextvars.Cont
 )
 
 _DEFAULT_STREAM_DRAIN_TIMEOUT = 2.0
+_CODEX_FAILURE_KIND_VALUES = frozenset(
+    {"exception", "postprocess_exception", "codex_error"}
+)
 
 
 def _stream_drain_timeout() -> float:
@@ -89,6 +92,10 @@ def _emit_codex_lifecycle_event(
         ("outcome", outcome, 32),
         ("failure_kind", failure_kind, 32),
     ):
+        if key == "failure_kind" and (
+            not isinstance(value, str) or value not in _CODEX_FAILURE_KIND_VALUES
+        ):
+            continue
         if isinstance(value, str) and value:
             context[key] = value[:limit]
     if isinstance(usage, dict):

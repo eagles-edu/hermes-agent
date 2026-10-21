@@ -135,8 +135,14 @@ class TurnFacadeMixin:
             # Publish the session accounting handles the same way so auxiliary calls record their token
             # usage into session_model_usage (task dimension) — the fix for aux spend being invisible in
             # analytics (issue #23270).
+            from agent.turn_usage import profile_aux_usage_callback
+
+            aux_usage_callback = profile_aux_usage_callback(self, relay_turn_id)
+
             acct_token = set_accounting_context(
-                getattr(self, "_session_db", None), getattr(self, "session_id", None)
+                getattr(self, "_session_db", None),
+                getattr(self, "session_id", None),
+                on_usage=aux_usage_callback,
             )
 
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).

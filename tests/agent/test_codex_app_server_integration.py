@@ -70,6 +70,44 @@ def _make_codex_agent(**kwargs):
 
 class TestRunConversationCodexPath:
     @pytest.mark.parametrize(
+        "failure_kind,expected",
+        [
+            ("exception", "exception"),
+            ("postprocess_exception", "postprocess_exception"),
+            ("codex_error", "codex_error"),
+            ("private-token-canary-7f31", None),
+        ],
+    )
+    def test_codex_lifecycle_failure_kind_is_a_closed_vocabulary(
+        self, failure_kind, expected
+    ):
+        from agent.codex_runtime import _emit_codex_lifecycle_event
+
+        events = []
+        agent = SimpleNamespace(
+            event_callback=lambda name, context: events.append((name, context)),
+            session_id="session-safe",
+            model="gpt-safe",
+            provider="openai-codex",
+            session_cwd="/tmp/safe",
+        )
+
+        _emit_codex_lifecycle_event(
+            agent,
+            "codex:turn:end",
+            attempt_id="attempt-safe",
+            turn_id="turn-safe",
+            outcome="failed",
+            failure_kind=failure_kind,
+        )
+
+        assert len(events) == 1
+        context = events[0][1]
+        assert context.get("failure_kind") == expected
+        if expected is None:
+            assert "private-token-canary-7f31" not in repr(events)
+
+    @pytest.mark.parametrize(
         "reasoning_config,service_tier,expected_effort,expected_tier",
         [
             ({"enabled": True, "effort": "high"}, "priority", "high", "fast"),

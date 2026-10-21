@@ -177,6 +177,18 @@ def _load_hook_dir(hook_dir: Path) -> Optional[tuple]:
     return hook_name, events, durable_events, handle_fn, manifest.get("description", "")
 
 
+def _project_usage_enabled(profile_home: Path) -> bool:
+    """Return whether this Hermes profile explicitly enabled its local usage reader."""
+    try:
+        config_path = profile_home / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return False
+    plugins = config.get("plugins", {}) if isinstance(config, dict) else {}
+    enabled = plugins.get("enabled", []) if isinstance(plugins, dict) else []
+    return isinstance(enabled, list) and "project-usage" in enabled
+
+
 class HookRegistry:
     """Discovers, loads, and fires event hooks."""
 
@@ -227,7 +239,7 @@ class HookRegistry:
                 }
             )
             print(f"[hooks] Loaded hook '{hook_name}' for events: {events}", flush=True)
-        if self._durable_handlers:
+        if self._durable_handlers or _project_usage_enabled(hooks_dir.parent):
             home = hooks_dir.parent
             self._outbox = CodexLifecycleOutbox(
                 home / "curatormd" / "codex-outbox.sqlite3",
@@ -270,6 +282,14 @@ class HookRegistry:
         if self._outbox is None or event_type not in self._durable_handlers:
             return None
         return self._outbox.enqueue(event_type, context or {})
+
+    def record_agent_usage(
+        self, session_id: Any, turn_id: Any, groups: Any,
+    ) -> int:
+        """Record local aggregate API usage only when this profile has an explicit binding."""
+        if self._outbox is None or not isinstance(groups, list):
+            return 0
+        return self._outbox.record_agent_usage(session_id, turn_id, groups)
 
     async def emit_durable(self, event: dict[str, Any]) -> bool:
         """Deliver a persisted event and acknowledge only explicit consumer success."""

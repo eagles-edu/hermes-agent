@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from typing import TYPE_CHECKING
 import asyncio
 import dataclasses
@@ -220,6 +221,17 @@ class GatewayTurnPersistenceMixin:
 
     async def _hmwa_post_turn_hooks(self, hook_ctx, agent_result, response):
         """agent:end hook, process-watcher scheduling, and watch-notification drain."""
+        usage_turn_id = agent_result.pop("_profile_usage_turn_id", None)
+        usage_groups = agent_result.pop("_profile_usage_groups", None)
+        try:
+            self.hooks.record_agent_usage(
+                hook_ctx.get("session_id"),
+                usage_turn_id,
+                usage_groups,
+            )
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            # Usage accounting is best-effort and must not block response delivery.
+            logger.warning("profile-local project usage write failed (%s)", type(exc).__name__)
         await self.hooks.emit("agent:end", {
             **hook_ctx, "response": (response or "")[:500], "model": agent_result.get("model", ""),
             "provider": agent_result.get("provider", ""),

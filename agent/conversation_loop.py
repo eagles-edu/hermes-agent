@@ -1770,6 +1770,13 @@ def run_conversation(
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
+        turn_id = getattr(agent, "_current_turn_id", None)
+        if isinstance(turn_id, str) and turn_id:
+            # Some terminal retry/error paths return before finalize_turn. Attach any
+            # provider usage accumulated before that exit at the common result boundary.
+            from agent.turn_finalizer import _attach_profile_usage
+
+            _attach_profile_usage(result, agent, turn_id)
     _close_durable_failed_turn(agent, result)
     return result
 

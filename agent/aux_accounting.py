@@ -12,26 +12,31 @@ from __future__ import annotations
 
 import logging
 from contextvars import ContextVar
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 # (session_db, session_id) for the active agent turn, or None outside one.
-_accounting: ContextVar[Optional[tuple]] = ContextVar("aux_accounting_context", default=None)
+_accounting: ContextVar[Optional[tuple[Any, str, Optional[Callable[..., None]]]]] = ContextVar(
+    "aux_accounting_context", default=None
+)
 
 # MoA advisor/aggregator usage is already folded into conversation_loop's
 # update_token_counts delta (tokens AND cost); recording it here would double-count.
 _EXCLUDED_TASKS = frozenset({"moa_reference", "moa_aggregator"})
 
 
-def set_accounting_context(session_db: Any, session_id: Optional[str]):
+def set_accounting_context(
+    session_db: Any, session_id: Optional[str],
+    on_usage: Optional[Callable[[Any, Optional[str], Optional[str]], None]] = None,
+):
     """Publish the active session's accounting handles; returns the token for ``reset_accounting_context``.
 
     ``None`` handles (no DB / no session id) clear the context.
     """
     if session_db is None or not session_id:
         return _accounting.set(None)
-    return _accounting.set((session_db, session_id))
+    return _accounting.set((session_db, session_id, on_usage))
 
 
 def reset_accounting_context(token) -> None:
@@ -59,21 +64,40 @@ def record_aux_usage(
         ctx = _accounting.get()
         if ctx is None:
             return
-        session_db, session_id = ctx
+        session_db, session_id, on_usage = ctx
         raw_usage = getattr(response, "usage", None)
         if raw_usage is None:
+            if on_usage is not None:
+                try:
+                    on_usage(None, provider, getattr(response, "model", None))
+                except Exception:
+                    logger.debug("Aux profile usage callback failed", exc_info=True)
             return
 
         from agent.usage_pricing import estimate_usage_cost, normalize_usage, with_served_service_tier
 
-        usage = with_served_service_tier(normalize_usage(raw_usage, provider=provider), response)
+        model = str(getattr(response, "model", "") or "") or None
+        try:
+            usage = with_served_service_tier(normalize_usage(raw_usage, provider=provider), response)
+        except Exception:
+            if on_usage is not None:
+                try:
+                    on_usage(None, provider, model)
+                except Exception:
+                    logger.debug("Aux profile usage callback failed", exc_info=True)
+            raise
+        if on_usage is not None:
+            try:
+                on_usage(usage, provider, model)
+            except Exception:
+                logger.debug("Aux profile usage callback failed", exc_info=True)
         if not (
             usage.input_tokens or usage.output_tokens
             or usage.cache_read_tokens or usage.cache_write_tokens
             or usage.reasoning_tokens
         ):
             return
-        model = str(getattr(response, "model", "") or "") or "unknown"
+        model = model or "unknown"
         estimated_cost = None
         try:
             cost = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)

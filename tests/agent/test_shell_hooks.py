@@ -295,6 +295,18 @@ class TestParseHooksBlock:
         assert shell_hooks._parse_hooks_block("string") == []
         assert shell_hooks._parse_hooks_block([]) == []
 
+    def test_gateway_plugin_entries_are_not_shell_hook_events(self, caplog):
+        """Gateway hook MCP permissions share this config block, not shell hooks."""
+        specs, complete = shell_hooks._parse_hooks({
+            "entries": {"curator-v2": {"mcp_allowlist": ["curator_v2"]}},
+            "pre_tool_call": [{"command": "/bin/true"}],
+        })
+        assert complete is True
+        assert [(spec.event, spec.command) for spec in specs] == [
+            ("pre_tool_call", "/bin/true")
+        ]
+        assert "unknown hook event" not in caplog.text
+
     def test_non_tool_event_matcher_warns_and_drops(self):
         """matcher: is only honored for pre/post_tool_call; must drop it
         on other events so the spec reflects runtime."""
@@ -689,6 +701,7 @@ class TestRoutedProfileEnv:
         monkeypatch.setenv("HERMES_HOME", str(launch))
         monkeypatch.setenv("OPENAI_API_KEY", "sk-default-profile")
         monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+        monkeypatch.setattr("tools.environments.local._resolve_hermes_bin_dir", lambda: "")
         script = _write_script(
             tmp_path, "env_dump.sh",
             "#!/usr/bin/env bash\ncat > /dev/null\n"
@@ -701,6 +714,7 @@ class TestRoutedProfileEnv:
             payload = json.loads(shell_hooks._serialize_payload("pre_tool_call", {"tool_name": "terminal"}))
         finally:
             reset_hermes_home_override(token)
+        assert result["returncode"] == 0, result.get("error") or result.get("stderr")
         seen = json.loads(result["stdout"])
         assert seen["home"] == str(routed)
         assert seen["key"] == ""

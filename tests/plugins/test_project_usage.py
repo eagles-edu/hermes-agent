@@ -86,11 +86,18 @@ def test_reads_only_configured_project_aggregates_without_private_ids(tmp_path, 
     after = _ledger_snapshot(db_path)
 
     assert report["status"] == "available"
-    assert report["coverage"].startswith("Codex app-server turns")
+    assert report["coverage"].startswith("bound Codex app-server")
+    assert report["sources"] == ["codex_app_server"]
     assert report["project_id"] == "gptmd"
     assert report["turns"] == 2
     assert report["reported_turns"] == 1
     assert report["unknown_usage_turns"] == 1
+    assert report["coverage_complete"] is False
+    assert report["coverage_exclusions"] == [
+        "auxiliary_calls_outside_active_turn_context",
+        "auxiliary_attempts_without_response", "unbound_sessions",
+    ]
+    assert report["tokens_complete"] is False
     assert report["tokens"] == {
         "input": 100,
         "output": 25,
@@ -119,6 +126,60 @@ def test_reads_only_configured_project_aggregates_without_private_ids(tmp_path, 
         assert private_value not in serialized
     assert before == after
     outbox._connection.close()
+
+
+def test_includes_provider_api_turns_without_overcounting_multiple_models(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _configure(home, "vhost")
+
+    from gateway.codex_outbox import CodexLifecycleOutbox
+
+    outbox = CodexLifecycleOutbox(profile_id="vhost-coding")
+    assert outbox.bind_goal("vhost", "session-private", "goal-private")
+    groups = [
+        {
+            "provider": "anthropic", "model": "claude-sonnet", "usage_status": "reported",
+            "input_tokens": 30, "output_tokens": 7, "total_tokens": 41,
+            "cache_read_tokens": 4, "cache_write_tokens": 0, "reasoning_tokens": 2,
+        },
+        {
+            "provider": "openai", "model": "gpt-5.6", "usage_status": "reported",
+            "input_tokens": 10, "output_tokens": 3, "total_tokens": 13,
+            "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 1,
+        },
+    ]
+    assert outbox.record_agent_usage("session-private", "turn-private", groups) == 2
+    assert outbox.record_agent_usage("session-private", "turn-private", groups) == 0
+    assert outbox.record_agent_usage("session-private", "turn-unknown", [{
+        "provider": "google", "model": "gemini", "usage_status": "unknown",
+        "input_tokens": None, "output_tokens": None, "total_tokens": None,
+        "cache_read_tokens": None, "cache_write_tokens": None, "reasoning_tokens": None,
+    }]) == 1
+    db_path = home / "curatormd" / "codex-outbox.sqlite3"
+    before = _ledger_snapshot(db_path)
+
+    report = json.loads(_tool().handler({}))
+
+    assert _ledger_snapshot(db_path) == before
+    assert report["status"] == "available"
+    assert report["sources"] == ["hermes_agent_api"]
+    assert report["turns"] == 2
+    assert report["reported_turns"] == 1
+    assert report["unknown_usage_turns"] == 1
+    assert report["tokens_complete"] is False
+    assert report["tokens"] == {
+        "input": 40, "output": 10, "total": 54, "cache_read": 4,
+        "cache_write": 0, "reasoning": 3,
+    }
+    assert {row["provider"] for row in report["by_provider_model"]} == {
+        "anthropic", "google", "openai",
+    }
+    serialized = json.dumps(report)
+    for private_value in ("session-private", "goal-private", "turn-private"):
+        assert private_value not in serialized
+    outbox.close()
 
 
 def test_missing_ledger_is_unavailable_and_not_a_zero_usage_claim(tmp_path, monkeypatch):
@@ -152,6 +213,12 @@ def test_empty_ledger_reports_zero_turns_without_inventing_token_totals(tmp_path
     assert report["reported_turns"] == 0
     assert report["unknown_usage_turns"] == 0
     assert set(report["tokens"].values()) == {None}
+    assert report["coverage_complete"] is False
+    assert report["coverage_exclusions"] == [
+        "auxiliary_calls_outside_active_turn_context",
+        "auxiliary_attempts_without_response", "unbound_sessions",
+    ]
+    assert report["tokens_complete"] is True
     assert report["by_provider_model"] == []
     outbox._connection.close()
 

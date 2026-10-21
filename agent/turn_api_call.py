@@ -72,6 +72,7 @@ def perform_api_call(
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
     response = None
+    provider_call_started = False
 
     def _verdict(action: str) -> ApiCallVerdict:
         return ApiCallVerdict(
@@ -86,11 +87,13 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        nonlocal provider_call_started
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
+        provider_call_started = True
         if _use_streaming:
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
@@ -136,6 +139,14 @@ def perform_api_call(
             provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
             api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
         )
+    except Exception:
+        if provider_call_started:
+            # The provider may have processed and billed a request before the transport
+            # failed. Preserve that uncertainty in profile-local totals across retries.
+            from agent.turn_usage import _record_profile_usage
+
+            _record_profile_usage(agent, None)
+        raise
     finally:
         with _bracket:
             if _model_request_active is not None:

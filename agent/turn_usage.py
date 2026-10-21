@@ -11,15 +11,143 @@ model/provider. Logger name stays ``agent.conversation_loop`` for caplog parity.
 from __future__ import annotations
 
 import logging
-from contextlib import suppress
+import re
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from threading import RLock
+from typing import Any, Callable, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
 from agent.usage_pricing import estimate_usage_cost, normalize_usage, with_served_service_tier
 
 logger = logging.getLogger("agent.conversation_loop")
+
+_PROJECT_USAGE_TOKEN_FIELDS = (
+    "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+    "cache_write_tokens", "reasoning_tokens",
+)
+_PROFILE_ROUTE_UNSET = object()
+_PROFILE_USAGE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+ -]{0,127}$")
+
+
+def _record_profile_usage(
+    agent: Any, usage: Any, *, turn_id: Any = None,
+    route_provider: Any = _PROFILE_ROUTE_UNSET,
+    route_model: Any = _PROFILE_ROUTE_UNSET,
+) -> None:
+    """Accumulate token usage by provider/model for one local Hermes turn only."""
+    lock = getattr(agent, "_profile_usage_lock", None)
+    with lock if lock is not None else nullcontext():
+        active_turn_id = getattr(agent, "_current_turn_id", None)
+        if turn_id is not None and active_turn_id != turn_id:
+            return
+        turn_id = active_turn_id
+        if not isinstance(turn_id, str) or not turn_id:
+            return
+        if getattr(agent, "_profile_usage_turn_id", None) != turn_id:
+            agent._profile_usage_turn_id = turn_id
+            agent._profile_usage_groups = {}
+            agent._profile_usage_overflow = False
+
+        # Main responses use Hermes' selected billing route. Auxiliary calls pass
+        # their own resolved route so they are not charged to the main model.
+        provider = (
+            getattr(agent, "provider", None)
+            if route_provider is _PROFILE_ROUTE_UNSET else route_provider
+        )
+        model = (
+            getattr(agent, "model", None)
+            if route_model is _PROFILE_ROUTE_UNSET else route_model
+        )
+        invalid_route = any(
+            value is None
+            or not isinstance(value, str)
+            or not _PROFILE_USAGE_LABEL_RE.fullmatch(value)
+            for value in (provider, model)
+        )
+        provider = provider if isinstance(provider, str) and _PROFILE_USAGE_LABEL_RE.fullmatch(provider) else None
+        model = model if isinstance(model, str) and _PROFILE_USAGE_LABEL_RE.fullmatch(model) else None
+        key = (provider, model)
+        groups = agent._profile_usage_groups
+        if key not in groups and len(groups) >= 49:
+            agent._profile_usage_overflow = True
+            return
+        group = groups.setdefault(key, {"unknown": False, **dict.fromkeys(_PROJECT_USAGE_TOKEN_FIELDS, 0)})
+        if usage is None or invalid_route:
+            group["unknown"] = True
+            return
+        values = {
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+            "cache_read_tokens": getattr(usage, "cache_read_tokens", None),
+            "cache_write_tokens": getattr(usage, "cache_write_tokens", None),
+            "reasoning_tokens": getattr(usage, "reasoning_tokens", None),
+        }
+        if any(type(value) is not int or value < 0 or value > 10**12 for value in values.values()):
+            group["unknown"] = True
+            return
+        for field, value in values.items():
+            group[field] += value
+        if any(group[field] > 10**12 for field in _PROJECT_USAGE_TOKEN_FIELDS):
+            group["unknown"] = True
+
+
+def profile_aux_usage_callback(
+    agent: Any, turn_id: str,
+) -> Callable[[Any, str | None, str | None], None]:
+    """Return the thread-safe callback that folds auxiliary responses into this turn."""
+    if getattr(agent, "_profile_usage_lock", None) is None:
+        agent._profile_usage_lock = RLock()
+
+    def _record(usage: Any, provider: str | None, model: str | None) -> None:
+        _record_profile_usage(
+            agent,
+            usage,
+            turn_id=turn_id,
+            route_provider=provider,
+            route_model=model,
+        )
+
+    return _record
+
+
+def profile_usage_snapshot(agent: Any, turn_id: str) -> list[dict[str, Any]]:
+    """Return bounded, token-only aggregates for the specified turn."""
+    lock = getattr(agent, "_profile_usage_lock", None)
+    with lock if lock is not None else nullcontext():
+        if (
+            getattr(agent, "_profile_usage_turn_id", None) != turn_id
+            or not isinstance(getattr(agent, "_profile_usage_groups", None), dict)
+        ):
+            return []
+        rows: list[dict[str, Any]] = []
+        for (provider, model), group in sorted(
+            agent._profile_usage_groups.items(),
+            key=lambda item: (item[0][0] or "", item[0][1] or ""),
+        ):
+            row = {"provider": provider, "model": model}
+            unknown = bool(group["unknown"])
+            row["usage_status"] = "unknown" if unknown else "reported"
+            row.update({field: None if unknown else int(group[field]) for field in _PROJECT_USAGE_TOKEN_FIELDS})
+            rows.append(row)
+        if getattr(agent, "_profile_usage_overflow", False):
+            overflow_group = agent._profile_usage_groups.get((None, None))
+            if overflow_group is None:
+                rows.append({
+                    "provider": None,
+                    "model": None,
+                    "usage_status": "unknown",
+                    **dict.fromkeys(_PROJECT_USAGE_TOKEN_FIELDS),
+                })
+            else:
+                for row in rows:
+                    if row["provider"] is None and row["model"] is None:
+                        row["usage_status"] = "unknown"
+                        row.update(dict.fromkeys(_PROJECT_USAGE_TOKEN_FIELDS))
+                        break
+        return rows
 
 
 def _agent_session_source(agent: Any) -> str:
@@ -84,6 +212,7 @@ def record_response_usage(
     # must remain observable.
     agent.session_api_calls += 1
     if not (hasattr(response, 'usage') and response.usage):
+        _record_profile_usage(agent, None)
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the
             # pending verdict so later readings aren't charged to it and
@@ -100,6 +229,14 @@ def record_response_usage(
 
     canonical_usage = with_served_service_tier(
         normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode), response)
+    _moa_client = getattr(agent, "client", None)
+    # Advisor fan-out cannot be attributed to the exact provider/model from this
+    # response, so keep this model group explicitly unknown rather than mislabel it.
+    _record_profile_usage(
+        agent,
+        None if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage")
+        else canonical_usage,
+    )
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage

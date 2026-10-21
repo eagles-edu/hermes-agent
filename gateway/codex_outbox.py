@@ -40,6 +40,7 @@ _USAGE_FIELDS = frozenset({
 })
 _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+ -]{0,127}$")
 _OUTCOME_VALUES = frozenset({"completed", "interrupted", "failed"})
+_FAILURE_KIND_VALUES = frozenset({"exception", "postprocess_exception", "codex_error"})
 _PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$")
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$")
 
@@ -114,6 +115,25 @@ class CodexLifecycleOutbox:
         self._connection.execute(
             "CREATE INDEX IF NOT EXISTS project_usage_project_time "
             "ON project_usage_events(project_id, occurred_at)"
+        )
+        usage_columns = {
+            row[1] for row in self._connection.execute(
+                "PRAGMA table_info(project_usage_events)"
+            ).fetchall()
+        }
+        if "turn_id" not in usage_columns:
+            self._connection.execute("ALTER TABLE project_usage_events ADD COLUMN turn_id TEXT")
+        if "usage_source" not in usage_columns:
+            self._connection.execute(
+                "ALTER TABLE project_usage_events ADD COLUMN usage_source TEXT NOT NULL "
+                "DEFAULT 'codex_app_server'"
+            )
+        self._connection.execute(
+            "UPDATE project_usage_events SET turn_id = event_id WHERE turn_id IS NULL OR turn_id = ''"
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS project_usage_turn "
+            "ON project_usage_events(project_id, turn_id)"
         )
         self._connection.execute(
             """CREATE TABLE IF NOT EXISTS goal_binding_history (
@@ -234,11 +254,22 @@ class CodexLifecycleOutbox:
                     }
                     if event_type == "codex:turn:end":
                         self._record_project_usage(
-                            event_id, existing[3], existing[4], existing[1], context
+                            event_id, existing[3], existing[4], existing[1], context, source_id
                         )
                     self._connection.commit()
                     return envelope
-                retained_context = {key: context[key] for key in sorted(allowed) if key in context}
+                retained_context = {
+                    key: context[key]
+                    for key in sorted(allowed)
+                    if key in context
+                    and (
+                        key != "failure_kind"
+                        or (
+                            isinstance(context[key], str)
+                            and context[key] in _FAILURE_KIND_VALUES
+                        )
+                    )
+                }
                 if any(
                     not isinstance(value, str)
                     or len(value) > 256
@@ -265,7 +296,7 @@ class CodexLifecycleOutbox:
                     (event_id, source_id, sequence, event_type, now, serialized, project_id, goal_id),
                 )
                 if event_type == "codex:turn:end":
-                    self._record_project_usage(event_id, project_id, goal_id, now, context)
+                    self._record_project_usage(event_id, project_id, goal_id, now, context, source_id)
                 self._connection.commit()
             except BaseException:
                 self._connection.rollback()
@@ -274,9 +305,18 @@ class CodexLifecycleOutbox:
 
     def _record_project_usage(
         self, event_id: str, project_id: str, goal_id: str, occurred_at: str,
-        context: Mapping[str, Any],
+        context: Mapping[str, Any], source_id: str,
     ) -> None:
         """Keep token accounting local to Hermes; never add it to the Curator event envelope."""
+        # Pre-migration rows used the envelope event ID as their usage ID. A
+        # replay after schema upgrade must not add a second stable-ID row.
+        legacy_row = self._connection.execute(
+            "SELECT 1 FROM project_usage_events WHERE event_id = ? "
+            "AND usage_source = 'codex_app_server'",
+            (event_id,),
+        ).fetchone()
+        if legacy_row is not None:
+            return
         raw_usage = context.get("usage")
         usage: dict[str, int] = {}
         if isinstance(raw_usage, Mapping) and not (set(raw_usage) - _USAGE_FIELDS):
@@ -290,32 +330,145 @@ class CodexLifecycleOutbox:
         model = context.get("model")
         provider = provider if isinstance(provider, str) and _LABEL_RE.fullmatch(provider) else None
         model = model if isinstance(model, str) and _LABEL_RE.fullmatch(model) else None
+        raw_turn_id = context.get("turn_id")
+        turn_id = raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else event_id
+        private_turn_id = hashlib.sha256(f"{source_id}\0{turn_id}".encode()).hexdigest()
+        usage_event_id = "hermes-" + hashlib.sha256("\0".join((
+            source_id, "codex-app-server", turn_id, provider or "", model or "",
+        )).encode()).hexdigest()
         self._connection.execute(
             """INSERT OR IGNORE INTO project_usage_events(
                 event_id, project_id, goal_id, occurred_at, provider, model, usage_status,
                 input_tokens, output_tokens, total_tokens, cache_read_tokens,
-                cache_write_tokens, reasoning_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (event_id, project_id, goal_id, occurred_at, provider, model,
+                cache_write_tokens, reasoning_tokens, turn_id, usage_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (usage_event_id, project_id, goal_id, occurred_at, provider, model,
              status, *(usage.get(key) for key in (
                  "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
                  "cache_write_tokens", "reasoning_tokens",
-             ))),
+             )), private_turn_id, "codex_app_server"),
         )
 
+    def record_agent_usage(
+        self, session_id: str, turn_id: str, groups: list[Mapping[str, Any]],
+    ) -> int:
+        """Persist bounded provider-API usage only for an explicitly bound profile session."""
+        if (
+            not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id)
+            or not isinstance(turn_id, str) or not _SESSION_ID_RE.fullmatch(turn_id)
+            or type(groups) is not list or not groups or len(groups) > 50
+        ):
+            return 0
+
+        normalized: list[dict[str, Any]] = []
+        seen_models: set[tuple[str | None, str | None]] = set()
+        token_names = (
+            "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+            "cache_write_tokens", "reasoning_tokens",
+        )
+        required = {"provider", "model", "usage_status", *token_names}
+        for group in groups:
+            if not isinstance(group, Mapping) or set(group) != required:
+                return 0
+            provider = group["provider"]
+            model = group["model"]
+            if provider is not None and (
+                not isinstance(provider, str) or not _LABEL_RE.fullmatch(provider)
+            ):
+                return 0
+            if model is not None and (
+                not isinstance(model, str) or not _LABEL_RE.fullmatch(model)
+            ):
+                return 0
+            model_key = (provider, model)
+            if model_key in seen_models:
+                return 0
+            seen_models.add(model_key)
+            status = group["usage_status"]
+            if not isinstance(status, str) or status not in {"reported", "unknown"}:
+                return 0
+            tokens = [group[name] for name in token_names]
+            if status == "reported":
+                if any(type(value) is not int or value < 0 or value > 10**12 for value in tokens):
+                    return 0
+            elif any(value is not None for value in tokens):
+                return 0
+            normalized.append({
+                "provider": provider,
+                "model": model,
+                "usage_status": status,
+                **dict(zip(token_names, tokens, strict=True)),
+            })
+
+        occurred_at = datetime.now(UTC).isoformat(timespec="microseconds")
+        inserted = 0
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                bindings = self._connection.execute(
+                    "SELECT project_id, goal_id, source_id FROM active_goal_bindings "
+                    "WHERE session_id = ?", (session_id,),
+                ).fetchall()
+                if len(bindings) != 1:
+                    self._connection.rollback()
+                    return 0
+                project_id, goal_id, source_id = bindings[0]
+                private_turn_id = hashlib.sha256(
+                    f"{source_id}\0{turn_id}".encode()
+                ).hexdigest()
+                for group in normalized:
+                    stable_key = "\0".join((
+                        source_id, "agent-api", turn_id,
+                        group["provider"] or "", group["model"] or "",
+                    )).encode()
+                    event_id = "hermes-" + hashlib.sha256(stable_key).hexdigest()
+                    cursor = self._connection.execute(
+                        """INSERT OR IGNORE INTO project_usage_events(
+                            event_id, project_id, goal_id, occurred_at, provider, model,
+                            usage_status, input_tokens, output_tokens, total_tokens,
+                            cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                            turn_id, usage_source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            event_id, project_id, goal_id, occurred_at,
+                            group["provider"], group["model"], group["usage_status"],
+                            *(group[name] for name in token_names), private_turn_id, "hermes_agent_api",
+                        ),
+                    )
+                    inserted += max(cursor.rowcount, 0)
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+        return inserted
+
     def project_usage_totals(self, project_id: str) -> dict[str, int | str]:
-        """Summarize local Codex usage without returning session, goal, or event identifiers."""
+        """Summarize local Hermes usage without returning session, goal, or event identifiers."""
         with self._lock:
             row = self._connection.execute(
-                """SELECT COUNT(*), SUM(usage_status = 'reported'), SUM(usage_status = 'unknown'),
-                          SUM(input_tokens), SUM(output_tokens), SUM(total_tokens),
-                          SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(reasoning_tokens)
-                   FROM project_usage_events WHERE project_id = ?""",
-                (project_id,),
+                """WITH turn_usage AS (
+                       SELECT turn_id, MAX(usage_status = 'unknown') AS unknown_usage
+                       FROM project_usage_events WHERE project_id = ? GROUP BY turn_id
+                   ), token_totals AS (
+                       SELECT SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+                              SUM(total_tokens) AS total_tokens,
+                              SUM(cache_read_tokens) AS cache_read_tokens,
+                              SUM(cache_write_tokens) AS cache_write_tokens,
+                              SUM(reasoning_tokens) AS reasoning_tokens
+                       FROM project_usage_events WHERE project_id = ?
+                   )
+                   SELECT (SELECT COUNT(*) FROM turn_usage),
+                          (SELECT SUM(unknown_usage = 0) FROM turn_usage),
+                          (SELECT SUM(unknown_usage = 1) FROM turn_usage),
+                          token_totals.input_tokens, token_totals.output_tokens,
+                          token_totals.total_tokens, token_totals.cache_read_tokens,
+                          token_totals.cache_write_tokens, token_totals.reasoning_tokens
+                   FROM token_totals""",
+                (project_id, project_id),
             ).fetchone()
         return {
             "project_id": project_id,
-            "source": "codex_app_server",
+            "source": "hermes_profile",
             "turns": int(row[0] or 0),
             "reported_turns": int(row[1] or 0),
             "unknown_turns": int(row[2] or 0),
@@ -331,8 +484,8 @@ class CodexLifecycleOutbox:
         """Return aggregate token counts by provider/model, without session-level identifiers."""
         with self._lock:
             rows = self._connection.execute(
-                """SELECT provider, model, usage_status, COUNT(*), SUM(input_tokens),
-                          SUM(output_tokens), SUM(total_tokens)
+                """SELECT provider, model, usage_status, COUNT(DISTINCT turn_id),
+                          SUM(input_tokens), SUM(output_tokens), SUM(total_tokens)
                    FROM project_usage_events WHERE project_id = ?
                    GROUP BY provider, model, usage_status ORDER BY provider, model, usage_status""",
                 (project_id,),
