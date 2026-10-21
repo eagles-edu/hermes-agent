@@ -7,6 +7,10 @@ from types import SimpleNamespace
 
 def _agent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # The checkout is inside the real Hermes home; these tests need the
+    # already-active test interpreter, not the neighboring install manifest.
+    from pm import environments
+    monkeypatch.setattr(environments, "activate_dependencies", lambda _root: None)
     from run_agent import AIAgent
     return AIAgent(api_key="k", base_url="https://inference-api.nousresearch.com/v1", provider="nous",
                    api_mode="chat_completions", model="anthropic/claude-fable-5.1", session_id="t", platform="cli",

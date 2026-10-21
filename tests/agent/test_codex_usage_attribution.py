@@ -55,6 +55,12 @@ def _set_legacy_attribution(profile, enabled):
 @pytest.fixture
 def wire(profile, monkeypatch):
     """Replace only HTTP transports; use Hermes routing and the real SDK."""
+    # The checkout sits beneath the operator's Hermes install, so bootstrap's
+    # sealed-payload probe would otherwise read the neighboring live manifest.
+    from pm import environments
+
+    monkeypatch.setattr(environments, "activate_dependencies", lambda _root: None)
+
     from agent import auxiliary_client
     from run_agent import AIAgent
 
