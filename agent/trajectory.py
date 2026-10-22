@@ -5,8 +5,90 @@ import logging
 import os
 from datetime import datetime
 from typing import Any, Dict, List
+from agent.tool_argument_log_safety import (
+    is_curator_v2_tool,
+    tool_arguments_log_excerpt,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _trajectory_gpt_prefix(msg: dict[str, Any]) -> str:
+    """Leading ``<think>`` block from native reasoning tokens, if any."""
+    if msg.get("reasoning") and msg["reasoning"].strip():
+        return f"<think>\n{msg['reasoning']}\n</think>\n"
+    return ""
+
+
+def _with_think_block(content: str) -> str:
+    """Every gpt turn gets a <think> block (empty if none) for a consistent training format."""
+    return content if "<think>" in content else "<think>\n</think>\n" + content
+
+
+def _trajectory_tool_call_turn(msg: dict[str, Any]) -> str:
+    content = _trajectory_gpt_prefix(msg)
+    if msg.get("content") and msg["content"].strip():
+        # <REASONING_SCRATCHPAD> -> <think> (model reasons via XML when native thinking is off)
+        content += convert_scratchpad_to_think(msg["content"]) + "\n"
+    for tool_call in msg["tool_calls"]:
+        if not tool_call or not isinstance(tool_call, dict):
+            continue
+        function = tool_call["function"]
+        tool_name = function["name"]
+        raw_args = function["arguments"]
+        if is_curator_v2_tool(tool_name):
+            # Trajectory samples are durable local exports; preserve the call
+            # boundary while excluding its potentially sensitive payload.
+            arguments = {"_redacted": True}
+        else:
+            # Arguments were validated during conversation; degrade to {} rather than abort.
+            try:
+                arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Unexpected invalid JSON in trajectory conversion: %s",
+                    tool_arguments_log_excerpt(tool_name, raw_args, 100),
+                )
+                arguments = {}
+        tool_call_json = {"name": tool_name, "arguments": arguments}
+        content += f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>\n"
+    return _with_think_block(content).rstrip()
+
+
+def _trajectory_tool_responses(
+    msg: dict[str, Any], messages: list[dict[str, Any]], start: int
+) -> tuple[list[str], int]:
+    """Collect paired tool responses, redacting Curator V2 payloads entirely."""
+    tool_responses = []
+    index = start
+    while index < len(messages) and messages[index]["role"] == "tool":
+        tool_msg = messages[index]
+        tool_index = len(tool_responses)
+        tool_name = (
+            msg["tool_calls"][tool_index]["function"]["name"]
+            if tool_index < len(msg["tool_calls"])
+            else "unknown"
+        )
+        tool_content = tool_msg["content"]
+        if is_curator_v2_tool(tool_name):
+            tool_content = {"_redacted": True}
+        else:
+            try:  # Pretty-print non-Curator tool content when it looks like JSON.
+                if tool_content.strip().startswith(("{", "[")):
+                    tool_content = json.loads(tool_content)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        payload = json.dumps(
+            {
+                "tool_call_id": tool_msg.get("tool_call_id", ""),
+                "name": tool_name,
+                "content": tool_content,
+            },
+            ensure_ascii=False,
+        )
+        tool_responses.append(f"<tool_response>\n{payload}\n</tool_response>")
+        index += 1
+    return tool_responses, index
 
 
 def convert_scratchpad_to_think(content: str) -> str:

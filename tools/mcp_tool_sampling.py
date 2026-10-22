@@ -79,8 +79,11 @@ def _parse_tool_call_arguments(server_name: str, args) -> dict:
         try:
             return json.loads(args)
         except (json.JSONDecodeError, ValueError):
-            logger.warning("MCP server '%s': malformed tool_calls arguments from LLM (wrapping as raw): %.100s",
-                           server_name, args)
+            logger.warning(
+                "MCP server '%s': malformed tool_calls arguments from LLM "
+                "(wrapping as raw; argument text omitted)",
+                server_name,
+            )
             return {"_raw": args}
     return args if isinstance(args, dict) else {"_raw": str(args)}
 

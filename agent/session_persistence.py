@@ -2,6 +2,7 @@
 with intrinsic ``_DB_PERSISTED_MARKER`` dedup, ephemeral-scaffolding filtering, explicit
 trajectory export."""
 import hashlib
+import json
 
 import logging
 import re
@@ -22,6 +23,7 @@ from agent.lazy_forward import forward as _forward, forward_static as _forward_s
 from agent.memory_context import sanitize_context
 
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
+from agent.tool_argument_log_safety import is_curator_v2_tool
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.message_metadata import (
     DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID, copy_identity_fields,
@@ -47,6 +49,35 @@ _IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
 # Reasoning/codex fields are role-gated (assistant-only) inside _insert_message_rows.
 _ROW_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items")
 _PERSIST_AFTER_ADMISSION_INTERRUPT = "_persist_after_admission_interrupt"
+_REDACTED_CURATOR_V2_RESULT = "[redacted Curator V2 tool result]"
+
+
+def _durable_tool_calls(tool_calls: Any) -> list[Any] | None:
+    """Redact Curator V2 arguments in the durable transcript projection only."""
+    if not isinstance(tool_calls, list):
+        return None
+    durable_calls = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            durable_calls.append(tool_call)
+            continue
+        function = tool_call.get("function")
+        function_name = function.get("name") if isinstance(function, dict) else None
+        if (
+            not isinstance(function, dict)
+            or not isinstance(function_name, str)
+            or not is_curator_v2_tool(function_name)
+        ):
+            durable_calls.append(tool_call)
+            continue
+        durable_call = dict(tool_call)
+        durable_function = dict(function)
+        durable_function["arguments"] = json.dumps(
+            {"_redacted": True}, separators=(",", ":")
+        )
+        durable_call["function"] = durable_function
+        durable_calls.append(durable_call)
+    return durable_calls
 
 
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
@@ -210,7 +241,7 @@ def _db_flush_scan_start(agent, messages: list[dict]) -> int:
 
 
 def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any]:
-    """Build the session-db row for ``msg``, applying the persist override to THIS row only."""
+    """Build a durable session row, preserving live content but redacting Curator V2 payloads."""
     role = msg.get("role", "unknown")
     content = msg.get("content")
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
@@ -220,6 +251,10 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
         content, api_content = durable_user_row_content(agent, msg, content, api_content)
         ov_timestamp = getattr(agent, "_persist_user_message_timestamp", None)
         timestamp = timestamp if ov_timestamp is None else ov_timestamp
+    tool_name = msg.get("tool_name") or (msg.get("name") if role == "tool" else None)
+    if role == "tool" and isinstance(tool_name, str) and is_curator_v2_tool(tool_name):
+        content = _REDACTED_CURATOR_V2_RESULT
+        api_content = None
     if api_content == content:
         api_content = None
     # get_messages_as_conversation replays rows through sanitize_context().strip(); capture the sent bytes
@@ -232,8 +267,8 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
         "role": role, "content": _durable_content(content),
-        "tool_name": msg.get("tool_name") or (msg.get("name") if role == "tool" else None),
-        "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
+        "tool_name": tool_name,
+        "tool_calls": _durable_tool_calls(msg.get("tool_calls")),
         "tool_call_id": msg.get("tool_call_id"), "effect_disposition": msg.get("effect_disposition"),
         "token_count": msg.get("token_count"), "finish_reason": msg.get("finish_reason"),
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},

@@ -92,6 +92,10 @@ You can verify MCP in a few ways:
   connection fails, and `3` when the server is not in your config (`2` is
   argparse's usage error), so health probes and cron watchdogs can branch on
   `$?` instead of parsing the output
+- for the local Curator V2 stdio integration, append
+  `--probe-curator-status` to run its fixed read-only activity-status call with
+  Hermes-injected profile/session context. This checks the profile-to-ledger
+  path; it does not authenticate a human user or prove production readiness.
 
 A practical test prompt:
 

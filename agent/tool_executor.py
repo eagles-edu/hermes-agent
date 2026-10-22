@@ -53,6 +53,11 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.tool_argument_log_safety import (
+    is_curator_v2_tool,
+    tool_failure_log_value,
+    tool_result_log_value,
+)
 from tools.terminal_tool_lifecycle import get_active_env
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
@@ -1100,7 +1105,12 @@ def _commit_tool_result(
                 function_name, function_args, function_result, failed=is_error, tool_call_id=tool_call_id,
             )
         if is_error:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, error_preview(function_result))
+            logger.warning(
+                "Tool %s returned error (%.2fs): %s",
+                function_name,
+                tool_duration,
+                error_preview(tool_result_log_value(function_name, function_result)),
+            )
         elif success_log_chars is not None:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, success_log_chars)
         if not blocked:
@@ -1112,7 +1122,9 @@ def _commit_tool_result(
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
         if agent.verbose_logging:
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
-            _log_result = verbose_text(function_result)
+            _log_result = tool_result_log_value(
+                function_name, verbose_text(function_result)
+            )
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
     agent._current_tool = None
@@ -1374,13 +1386,21 @@ class _ConcurrentBatch:
             return _ToolOutcome(ref, result, duration, True, False)
         except Exception as tool_error:
             result = f"Error executing tool '{ref.name}': {tool_error}"
-            logger.error("_invoke_tool raised for %s: %s", ref.name, tool_error, exc_info=True)
+            if is_curator_v2_tool(ref.name):
+                logger.error(
+                    "_invoke_tool raised for %s: %s",
+                    ref.name,
+                    tool_failure_log_value(ref.name, tool_error),
+                )
+            else:
+                logger.error("_invoke_tool raised for %s: %s", ref.name, tool_error, exc_info=True)
         duration = time.time() - start
         if not blocked and not dispatched:
             ref.emit_post(agent, result, duration_ms=int(duration * 1000))
         is_error, _ = _detect_tool_failure(ref.name, result)
         if is_error:
-            logger.info("tool %s failed (%.2fs): %s", ref.name, duration, str(result)[:200])
+            safe_result = tool_result_log_value(ref.name, result)
+            logger.info("tool %s failed (%.2fs): %s", ref.name, duration, str(safe_result)[:200])
         else:
             result_chars = len(result) if isinstance(result, str) else len(str(result))
             logger.info(
@@ -1793,7 +1813,14 @@ def _run_sequential_call(
         if dispatch.error_result is None:
             raise
         function_result = dispatch.error_result(tool_error)
-        logger.error(dispatch.error_log, ref.name, tool_error, exc_info=True)
+        if is_curator_v2_tool(ref.name):
+            logger.error(
+                dispatch.error_log,
+                ref.name,
+                tool_failure_log_value(ref.name, tool_error),
+            )
+        else:
+            logger.error(dispatch.error_log, ref.name, tool_error, exc_info=True)
         managed = _ManagedToolResult(result=function_result, args=ref.args, middleware_trace=ref.trace, blocked=False, dispatched=False)
     finally:
         if dispatch.is_delegate:

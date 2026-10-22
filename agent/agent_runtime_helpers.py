@@ -25,7 +25,13 @@ from agent.tool_argument_log_safety import tool_arguments_log_excerpt
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.think_scrubber import THINK_TAG_NAMES
-from agent.trajectory import convert_scratchpad_to_think
+from agent.trajectory import (
+    _trajectory_gpt_prefix,
+    _trajectory_tool_call_turn,
+    _trajectory_tool_responses,
+    _with_think_block,
+    convert_scratchpad_to_think,
+)
 from agent.credential_pool import (
     STATUS_EXHAUSTED, _parse_absolute_timestamp, credential_pool_entry_serves_endpoint,
     credential_pool_matches_provider,
@@ -107,68 +113,6 @@ _TRAJECTORY_SYSTEM_PROMPT = (
     "Each function call should be enclosed within <tool_call> </tool_call> XML tags.\n"
     "Example:\n<tool_call>\n{{'name': <function-name>,'arguments': <args-dict>}}\n</tool_call>"
 )
-
-
-def _trajectory_gpt_prefix(msg: dict[str, Any]) -> str:
-    """Leading ``<think>`` block from native reasoning tokens, if any."""
-    if msg.get("reasoning") and msg["reasoning"].strip():
-        return f"<think>\n{msg['reasoning']}\n</think>\n"
-    return ""
-
-
-def _with_think_block(content: str) -> str:
-    """Every gpt turn gets a <think> block (empty if none) for a consistent training format."""
-    return content if "<think>" in content else "<think>\n</think>\n" + content
-
-
-def _trajectory_tool_call_turn(msg: dict[str, Any]) -> str:
-    content = _trajectory_gpt_prefix(msg)
-    if msg.get("content") and msg["content"].strip():
-        # <REASONING_SCRATCHPAD> -> <think> (model reasons via XML when native thinking is off)
-        content += convert_scratchpad_to_think(msg["content"]) + "\n"
-    for tool_call in msg["tool_calls"]:
-        if not tool_call or not isinstance(tool_call, dict):
-            continue
-        raw_args = tool_call["function"]["arguments"]
-        # Arguments were validated during conversation; degrade to {} rather than abort.
-        try:
-            arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-        except json.JSONDecodeError:
-            logger.warning(
-                "Unexpected invalid JSON in trajectory conversion: %s",
-                tool_arguments_log_excerpt(tool_call["function"].get("name", "?"), raw_args, 100),
-            )
-            arguments = {}
-        tool_call_json = {"name": tool_call["function"]["name"], "arguments": arguments}
-        content += f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>\n"
-    return _with_think_block(content).rstrip()
-
-
-def _trajectory_tool_responses(msg: dict[str, Any], messages: list[dict[str, Any]], start: int) -> tuple[list[str], int]:
-    """Collect the ``<tool_response>`` blocks for the tool run starting at ``start``; returns ``(blocks, next_index)``."""
-    tool_responses = []
-    j = start
-    while j < len(messages) and messages[j]["role"] == "tool":
-        tool_msg = messages[j]
-        tool_content = tool_msg["content"]
-        try:  # pretty-print tool content if it looks like JSON
-            if tool_content.strip().startswith(("{", "[")):
-                tool_content = json.loads(tool_content)
-        except (json.JSONDecodeError, AttributeError):
-            pass
-        tool_index = len(tool_responses)
-        tool_name = (
-            msg["tool_calls"][tool_index]["function"]["name"]
-            if tool_index < len(msg["tool_calls"])
-            else "unknown"
-        )
-        payload = json.dumps(
-            {"tool_call_id": tool_msg.get("tool_call_id", ""), "name": tool_name, "content": tool_content},
-            ensure_ascii=False,
-        )
-        tool_responses.append(f"<tool_response>\n{payload}\n</tool_response>")
-        j += 1
-    return tool_responses, j
 
 
 def convert_to_trajectory_format(agent, messages: list[dict[str, Any]], user_query: str, completed: bool) -> list[dict[str, Any]]:

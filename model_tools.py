@@ -23,6 +23,7 @@ from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
 from tools.arg_coercion import coerce_tool_args
 from tools.todo_tool import TODO_LEGACY_ALIASES, TODO_SCHEMA
+from agent.tool_argument_log_safety import is_curator_v2_tool, tool_failure_log_value
 from utils import file_signature
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,14 @@ def _is_dispatcher_owned_worker() -> bool:
         return is_dispatcher_owned_worker_context()
     except Exception:
         return True
+
+
+def _tool_exception_log_detail(function_name: str, error: Exception) -> Exception | str:
+    """Keep Curator V2 payloads out of hook and middleware exception logs."""
+
+    if is_curator_v2_tool(function_name):
+        return str(tool_failure_log_value(function_name, error))
+    return error
 
 
 # --- Async bridging (single source of truth; registry.dispatch uses it too) ---
@@ -695,7 +704,10 @@ def _emit_post_tool_call_hook(
             middleware_trace=list(middleware_trace or []),
         )
     except Exception as _hook_err:
-        logger.debug("post_tool_call hook error: %s", _hook_err)
+        logger.debug(
+            "post_tool_call hook error: %s",
+            _tool_exception_log_detail(function_name, _hook_err),
+        )
 
 
 def _dispatch_bridge_tool(function_name: str, function_args: dict[str, Any],
@@ -759,7 +771,10 @@ def _apply_request_middleware(
         mw = apply_tool_request_middleware(function_name, function_args, **ids.hook_kwargs())
         return mw.payload, mw.original_payload, mw.trace
     except Exception as _mw_err:
-        logger.debug("tool_request middleware error: %s", _mw_err)
+        logger.debug(
+            "tool_request middleware error: %s",
+            _tool_exception_log_detail(function_name, _mw_err),
+        )
         return function_args, dict(function_args), trace
 
 
@@ -783,7 +798,10 @@ def _pre_dispatch_guards(function_name: str, function_args: dict[str, Any], skip
             if modified_args is not None:
                 function_args = modified_args
         except Exception as _hook_err:
-            logger.debug("pre_tool_call hook error: %s", _hook_err)
+            logger.debug(
+                "pre_tool_call hook error: %s",
+                _tool_exception_log_detail(function_name, _hook_err),
+            )
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 
@@ -795,7 +813,10 @@ def _pre_dispatch_guards(function_name: str, function_args: dict[str, Any], skip
         if edit_block_message is not None:
             return function_args, (edit_block_message, "edit_approval_denied", None)
     except Exception as _edit_approval_err:
-        logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
+        logger.debug(
+            "ACP edit approval guard error: %s",
+            _tool_exception_log_detail(function_name, _edit_approval_err),
+        )
         if function_name in {"write_file", "patch"}:
             return function_args, (tool_error("Edit approval denied: approval guard failed"), "edit_approval_error", None)
     return function_args, None
@@ -862,7 +883,10 @@ def _apply_transform_tool_result_hook(function_name: str, function_args: dict[st
                                        status=status, error_type=error_type, error_message=error_message)
             return next((r for r in hook_results if isinstance(r, str)), result)
     except Exception as _hook_err:
-        logger.debug("transform_tool_result hook error: %s", _hook_err)
+        logger.debug(
+            "transform_tool_result hook error: %s",
+            _tool_exception_log_detail(function_name, _hook_err),
+        )
     return result
 
 
@@ -960,6 +984,21 @@ def handle_function_call(
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
 
     except Exception as e:
+        if is_curator_v2_tool(function_name):
+            safe_error = "Curator V2 tool failed."
+            error_msg = f"Error executing {function_name}: {safe_error}"
+            logger.error(
+                "Error executing %s: %s",
+                function_name,
+                tool_failure_log_value(function_name, e),
+            )
+            return _emit(
+                tool_error(_sanitize_tool_error(error_msg)),
+                duration_ms=_elapsed_ms(start),
+                status="error",
+                error_type=type(e).__name__,
+                error_message=safe_error,
+            )
         error_msg = f"Error executing {function_name}: {e!s}"
         logger.exception(error_msg)
         return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),

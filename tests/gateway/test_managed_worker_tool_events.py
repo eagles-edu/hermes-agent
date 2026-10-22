@@ -54,3 +54,44 @@ def test_worker_tool_frames_publish_the_in_process_payload(tmp_path):
                                              {'type': 'tool.start', 'tool_call_id': 'x', 'name': 'terminal'})
     finally:
         db.close()
+
+
+def test_curator_v2_viewer_events_redact_arguments_and_results(tmp_path):
+    from gateway.run_turn_progress import publish_worker_tool_event
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    try:
+        db.create_session('s', source='cli')
+        epoch = begin_runtime_epoch(db, instance_id='owner')
+        runner = SimpleNamespace(_draining=False, config=SimpleNamespace(multiplex_profiles=False))
+        authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db, epoch=epoch)
+        live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human'), 'route')
+        live.tool_progress_mode = 'verbose'
+        admit_session_input(db, epoch=epoch, principal_id='human', session_id='s', request_id='r', payload={'text': 'go'})
+        row = claim_session_input(db, epoch=epoch, session_id='s')
+        authority._stamp_claim(SimpleNamespace(session_id='s'), live, row)
+        frames, observed = [], []
+        live.event_stream.observers.add(frames.append)
+        authority.api_observers = {row['admission_id']: [{
+            'tool_start_callback': lambda *a: observed.append(('start', a)),
+            'tool_complete_callback': lambda *a: observed.append(('complete', a)),
+        }]}
+
+        tool_name = 'mcp__curator_v2__goal_report'
+        secret_fact = 'curator-viewer-canary-fact'
+        secret_result = '{"fact":"curator-viewer-canary-result"}'
+        args = {'goal_id': 'goal-private', 'private_fact': secret_fact}
+        start = _wire({'type': 'tool.start', **tool_frame('call-v2', tool_name, args)})
+        done = _wire({'type': 'tool.complete', **tool_frame('call-v2', tool_name, args, secret_result)})
+        assert publish_worker_tool_event(authority, 's', row['generation'], start)
+        assert publish_worker_tool_event(authority, 's', row['generation'], done)
+
+        published = [(frame['params']['type'], frame['params']['payload']) for frame in frames]
+        assert published[0][1]['context'] == '[redacted Curator V2 tool call]'
+        assert published[0][1]['args'] == {'_redacted': '[redacted Curator V2 tool arguments]'}
+        assert published[1][1]['result'] == '[redacted Curator V2 tool result]'
+        assert published[1][1]['result_text'] == '[redacted Curator V2 tool result]'
+        assert secret_fact not in repr(published) and secret_result not in repr(published)
+        assert observed == [('start', ('call-v2', tool_name, args)),
+                            ('complete', ('call-v2', tool_name, args, secret_result))]
+    finally:
+        db.close()
