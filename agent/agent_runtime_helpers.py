@@ -21,6 +21,7 @@ from agent.message_sanitization import (
 )
 from agent.message_metadata import (
     TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message)
+from agent.tool_argument_log_safety import tool_arguments_log_excerpt
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.think_scrubber import THINK_TAG_NAMES
@@ -133,7 +134,10 @@ def _trajectory_tool_call_turn(msg: dict[str, Any]) -> str:
         try:
             arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
         except json.JSONDecodeError:
-            logger.warning("Unexpected invalid JSON in trajectory conversion: %s", raw_args[:100])
+            logger.warning(
+                "Unexpected invalid JSON in trajectory conversion: %s",
+                tool_arguments_log_excerpt(tool_call["function"].get("name", "?"), raw_args, 100),
+            )
             arguments = {}
         tool_call_json = {"name": tool_call["function"]["name"], "arguments": arguments}
         content += f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>\n"
@@ -287,7 +291,8 @@ def sanitize_tool_call_arguments(
                 "Corrupted tool_call arguments repaired before request "
                 "(session=%s, message_index=%s, tool_call_id=%s, function=%s, "
                 "original_arguments=%r)", session_id or "-", message_index, tool_call_id or "-",
-                function_name, arguments[:_FULL_ARGS_LOG_BOUND],
+                function_name,
+                tool_arguments_log_excerpt(function_name, arguments, _FULL_ARGS_LOG_BOUND),
             )
             function["arguments"] = "{}"
             # The persisted row for a stamped dict still holds the corrupted args; pop the

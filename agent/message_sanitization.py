@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, NamedTuple
 
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER, hidden_interrupt_placeholder_row
 from agent.message_metadata import DB_ROW_SNAPSHOT
+from agent.tool_argument_log_safety import tool_arguments_log_excerpt
 from agent.vision_message_prep import _provider_model_key
 
 logger = logging.getLogger(__name__)
@@ -266,7 +267,11 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         fixed = fixed[:-1]
 
     if _loads_ok(fixed):
-        logger.warning("Repaired malformed tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], fixed[:80])
+        logger.warning(
+            "Repaired malformed tool_call arguments for %s: %s → %s", tool_name,
+            tool_arguments_log_excerpt(tool_name, raw_stripped, 80),
+            tool_arguments_log_excerpt(tool_name, fixed, 80),
+        )
         return fixed
 
     # Pass 5: escape control chars inside strings (strict=False alone fails when other
@@ -274,13 +279,15 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     escaped = _escape_invalid_chars_in_json_strings(fixed)
     if escaped != fixed and _loads_ok(escaped):
         logger.warning(
-            "Repaired control-char-laced tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], escaped[:80],
+            "Repaired control-char-laced tool_call arguments for %s: %s → %s", tool_name,
+            tool_arguments_log_excerpt(tool_name, raw_stripped, 80),
+            tool_arguments_log_excerpt(tool_name, escaped, 80),
         )
         return escaped
 
     logger.warning(
         "Unrepairable tool_call arguments for %s — replaced with empty object (was: %s)",
-        tool_name, raw_stripped[:_FULL_ARGS_LOG_BOUND],
+        tool_name, tool_arguments_log_excerpt(tool_name, raw_stripped, _FULL_ARGS_LOG_BOUND),
     )
     return "{}"
 

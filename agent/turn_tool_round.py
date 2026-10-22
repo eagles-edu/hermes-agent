@@ -16,6 +16,7 @@ from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id, normalize_provider_tool_call_ids
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
+from agent.tool_argument_log_safety import tool_arguments_log_excerpt
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -74,7 +75,7 @@ def run_tool_round(
     if agent.verbose_logging:
         for tc in assistant_message.tool_calls:
             raw_args = tc.function.arguments
-            args_preview = raw_args[:200] if isinstance(raw_args, str) else repr(raw_args)[:200]
+            args_preview = tool_arguments_log_excerpt(tc.function.name, raw_args, 200)
             logging.debug("Tool call: %s with args: %s...", tc.function.name, args_preview)
 
     _tvv = validate_tool_calls(
