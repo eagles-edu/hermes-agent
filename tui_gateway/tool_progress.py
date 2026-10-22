@@ -276,6 +276,12 @@ def _emit_tool_lifecycle(event, sid, name, args, payload):
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     if _connector_lifecycle_is_stale(sid, name, args):
         return
+    from agent.tool_argument_log_safety import (
+        is_curator_v2_tool,
+        tool_arguments_log_excerpt,
+    )
+
+    curator_v2 = is_curator_v2_tool(name)
     session = _sessions.get(sid)
     if session is not None:
         with contextlib.suppress(Exception):
@@ -290,14 +296,21 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         session.setdefault("tool_result_metadata", {}).pop(tool_call_id, None)
     if (_tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name)
             or _connector_tool_lifecycle(name, args)):
-        payload: dict[str, object] = {"tool_id": tool_call_id, "name": name, "context": _tool_ctx(name, args)}
-        if (labels := _tool_labels(name, args)) is not None:
+        context = "[redacted Curator V2 tool call]" if curator_v2 else _tool_ctx(name, args)
+        payload: dict[str, object] = {"tool_id": tool_call_id, "name": name, "context": context}
+        if not curator_v2 and (labels := _tool_labels(name, args)) is not None:
             payload["labels"] = labels
         # Full args (not just the 80-char `context` preview) so the desktop's expanded tool row is complete
         # while the tool runs. args.todos may be a partial merge — tool.complete is the truth.
         if args:
-            payload["args"] = args
-        if _session_verbose(sid) and (args_text := _tool_args_text(args)):
+            payload["args"] = (
+                {"_redacted": tool_arguments_log_excerpt(name, args, 0)}
+                if curator_v2
+                else args
+            )
+        if curator_v2 and _session_verbose(sid):
+            payload["args_text"] = tool_arguments_log_excerpt(name, args, 0)
+        elif _session_verbose(sid) and (args_text := _tool_args_text(args)):
             payload["args_text"] = args_text
         _emit_tool_lifecycle("tool.start", sid, name, args, payload)
 
@@ -308,8 +321,12 @@ def _prepare_tool_result_metadata(sid: str, tool_call_id: str, name: str, args: 
     Retain the exact preview for the post-flush event, including an empty preview
     for failed/no-op edits. A cold client reads the same sidecar from SQLite.
     """
+    from agent.tool_argument_log_safety import is_curator_v2_tool
+
     session = _sessions.get(sid)
     snapshot = session.setdefault("edit_snapshots", {}).pop(tool_call_id, None) if session is not None else None
+    if is_curator_v2_tool(name):
+        return {}
     metadata = {}
     with contextlib.suppress(Exception):
         from agent.display import render_edit_diff_with_delta
@@ -322,16 +339,30 @@ def _prepare_tool_result_metadata(sid: str, tool_call_id: str, name: str, args: 
 
 
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
+    from agent.tool_argument_log_safety import (
+        is_curator_v2_tool,
+        tool_arguments_log_excerpt,
+        tool_result_log_value,
+    )
+
+    curator_v2 = is_curator_v2_tool(name)
     session = _sessions.get(sid)
     prepared = session.setdefault("tool_result_metadata", {}) if session is not None else {}
     # Consume the pre-flush preview even when this completion is dropped as stale.
     metadata = prepared.pop(tool_call_id, None)
     if _connector_lifecycle_is_stale(sid, name, args):
         return
-    payload = {"tool_id": tool_call_id, "name": name, "args": args}
-    if (labels := _tool_labels(name, args)) is not None:
+    viewer_args = (
+        {"_redacted": tool_arguments_log_excerpt(name, args, 0)}
+        if curator_v2
+        else args
+    )
+    payload = {"tool_id": tool_call_id, "name": name, "args": viewer_args}
+    if not curator_v2 and (labels := _tool_labels(name, args)) is not None:
         payload["labels"] = labels
-    if metadata is None:
+    if curator_v2:
+        metadata = {}
+    elif metadata is None:
         # Native runtimes may emit lifecycle callbacks without the tool executor.
         metadata = _prepare_tool_result_metadata(sid, tool_call_id, name, args, result).get("tool_result_metadata", {})
         prepared.pop(tool_call_id, None)
@@ -340,15 +371,21 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     duration_s = time.time() - started_at if started_at else None
     if duration_s is not None:
         payload["duration_s"] = duration_s
-    try:
-        payload["result"] = json.loads(result)
-    except Exception:
-        payload["result"] = result
-    summary = _tool_summary(name, result, duration_s)
-    if summary:
-        payload["summary"] = summary
-    if _session_verbose(sid) and (result_text := _tool_result_text(result)):
-        payload["result_text"] = result_text
+    if curator_v2:
+        result_marker = tool_result_log_value(name, result)
+        payload["result"] = result_marker
+        if _session_verbose(sid):
+            payload["result_text"] = result_marker
+    else:
+        try:
+            payload["result"] = json.loads(result)
+        except Exception:
+            payload["result"] = result
+        summary = _tool_summary(name, result, duration_s)
+        if summary:
+            payload["summary"] = summary
+        if _session_verbose(sid) and (result_text := _tool_result_text(result)):
+            payload["result_text"] = result_text
     from tools.todo_tool import is_todo_tool_name
 
     todo_state = _normalize_todo_state(payload.get("result")) if is_todo_tool_name(name) else None

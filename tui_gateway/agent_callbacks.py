@@ -498,12 +498,33 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
             _emit("preview.restart.progress", parent, {"task_id": task_id, "level": level, "text": text})
 
     def tool_start(tool_call_id: str, name: str, args: dict) -> None:
+        from agent.tool_argument_log_safety import (
+            is_curator_v2_tool,
+            tool_arguments_log_excerpt,
+        )
+
         started_at[tool_call_id] = time.time()
-        ctx = _tool_ctx(name, args)
+        curator_v2 = is_curator_v2_tool(name)
+        ctx = (
+            tool_arguments_log_excerpt(name, args, 0)
+            if curator_v2
+            else _tool_ctx(name, args)
+        )
         progress(f"Running {name}{f': {ctx}' if ctx else ''}")
 
     def tool_complete(tool_call_id: str, name: str, _args: dict, result: str) -> None:
+        from agent.tool_argument_log_safety import (
+            is_curator_v2_tool,
+            tool_result_log_value,
+        )
+
         duration_s = time.time() - started_at.get(tool_call_id, time.time())
+        if is_curator_v2_tool(name):
+            progress(
+                f"Finished {name}{f' in {_fmt_tool_duration(duration_s)}' if duration_s else ''}"
+                f"\n{tool_result_log_value(name, result)}"
+            )
+            return
         summary = _tool_summary(name, result, duration_s) or f"Finished {name}{f' in {_fmt_tool_duration(duration_s)}' if duration_s else ''}"
         output = _preview_tool_result_preview(name, result)
         progress(summary + (f"\n{output}" if output else ""))
