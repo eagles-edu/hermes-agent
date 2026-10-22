@@ -741,3 +741,62 @@ class TestMcpEnvelopeSpillover:
 
         assert PERSISTED_OUTPUT_TAG in msgs[0]["content"]
         assert (get_spillover_dir() / "tc_budget_mcp.txt").read_text(encoding="utf-8") == markdown
+
+    def test_curator_v2_result_is_truncated_without_spillover(self, monkeypatch):
+        import tools.tool_result_storage as trs
+
+        canary = "CURATOR_RESULT_MUST_NOT_BE_ARCHIVED_73C1"
+        content = json.dumps({"result": "visible line\n" * 200 + canary})
+        monkeypatch.setattr(
+            trs,
+            "_write_to_spillover",
+            lambda *args, **kwargs: pytest.fail("Curator V2 output must not spill"),
+        )
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="mcp__curator_v2__goal_report",
+            tool_use_id="tc_curator_direct",
+            env=None,
+            config=BudgetConfig(preview_size=120),
+            threshold=100,
+        )
+
+        assert "[Curator V2 result truncated; Hermes did not archive the remainder.]" in result
+        assert canary not in result
+        assert not (get_spillover_dir() / "tc_curator_direct.txt").exists()
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "line\n" * 200 + "CURATOR_BUDGET_CANARY_851D",
+            [{"type": "text", "text": "line\n" * 200 + "CURATOR_BUDGET_CANARY_851D"}],
+        ],
+        ids=["string", "multimodal-text"],
+    )
+    def test_turn_budget_keeps_curator_name_and_never_spills(self, content, monkeypatch):
+        import tools.tool_result_storage as trs
+
+        canary = "CURATOR_BUDGET_CANARY_851D"
+        monkeypatch.setattr(
+            trs,
+            "_write_to_spillover",
+            lambda *args, **kwargs: pytest.fail("Curator V2 output must not spill"),
+        )
+        messages = [{
+            "role": "tool",
+            "name": "mcp__curator_v2__goal_report",
+            "tool_call_id": "tc_curator_budget",
+            "content": content,
+        }]
+
+        enforce_turn_budget(
+            messages,
+            env=None,
+            config=BudgetConfig(turn_budget=10, preview_size=80),
+        )
+
+        serialized = json.dumps(messages, ensure_ascii=False)
+        assert canary not in serialized
+        assert "Hermes did not archive the remainder" in serialized
+        assert not (get_spillover_dir() / "tc_curator_budget.txt").exists()

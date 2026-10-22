@@ -404,6 +404,23 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
         threshold = config.resolve_threshold(tool_name)
     if threshold == float("inf") or len(content) <= threshold:
         return content
+    from agent.tool_argument_log_safety import is_curator_v2_tool
+
+    if is_curator_v2_tool(tool_name):
+        # Curator output can contain compact user facts. Keep it available to the live
+        # model only; never archive it in Hermes spillover or sandbox temp storage.
+        pageable = _pageable_text(content)
+        preview, has_more = generate_preview(pageable, max_chars=config.preview_size)
+        if not has_more:
+            return content
+        logger.info(
+            "Inline-truncating large Curator V2 result: %s (%d chars, not archived)",
+            tool_name,
+            len(content),
+        )
+        return (
+            f"{preview}\n\n[Curator V2 result truncated; Hermes did not archive the remainder.]"
+        )
     # The size decision above stays on the raw inline result (that is what cost context); the file
     # and the preview carry the pageable text inside an MCP envelope (#90426).
     persisted_content = _pageable_text(content)
@@ -446,14 +463,20 @@ def _content_text_size(content) -> int:
     return len(content or "")
 
 
-def _spill_largest_text_part(parts: list, tool_use_id: str, env, config: BudgetConfig) -> tuple[list, int]:
+def _spill_largest_text_part(
+    parts: list,
+    tool_name: str,
+    tool_use_id: str,
+    env,
+    config: BudgetConfig,
+) -> tuple[list, int]:
     """Persist the largest non-persisted text part of a multimodal list; ``(new parts, chars saved)``."""
     texts = [(i, p["text"]) for i, p in enumerate(parts) if isinstance(p, dict) and p.get("type") == "text"
              and isinstance(p.get("text"), str) and PERSISTED_OUTPUT_TAG not in p["text"]]
     if not texts:
         return parts, 0
     idx, text = max(texts, key=lambda t: len(t[1]))
-    replacement = maybe_persist_tool_result(content=text, tool_name=_BUDGET_TOOL_NAME,
+    replacement = maybe_persist_tool_result(content=text, tool_name=tool_name,
                                             tool_use_id=f"{tool_use_id}_part{idx}", env=env, config=config, threshold=0)
     if replacement == text:
         return parts, 0
@@ -477,15 +500,24 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
             break
         content = tool_messages[idx]["content"]
         tool_use_id = tool_messages[idx].get("tool_call_id", f"budget_{idx}")
+        tool_name = (
+            tool_messages[idx].get("name")
+            or tool_messages[idx].get("tool_name")
+            or _BUDGET_TOOL_NAME
+        )
+        if not isinstance(tool_name, str):
+            tool_name = _BUDGET_TOOL_NAME
         if isinstance(content, list):
-            parts, saved = _spill_largest_text_part(content, tool_use_id, env, config)
+            parts, saved = _spill_largest_text_part(
+                content, tool_name, tool_use_id, env, config
+            )
             if saved:
                 total_size -= saved
                 tool_messages[idx]["content"] = parts
                 logger.info("Budget enforcement: persisted a text part of tool result %s (%d chars)", tool_use_id, saved)
             continue
         replacement = maybe_persist_tool_result(
-            content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
+            content=content, tool_name=tool_name, tool_use_id=tool_use_id,
             env=env, config=config, threshold=0)
         if replacement != content:
             total_size += len(replacement) - size
