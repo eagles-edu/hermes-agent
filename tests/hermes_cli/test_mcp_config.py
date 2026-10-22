@@ -280,6 +280,83 @@ class TestMcpAdd:
 class TestMcpTest:
 
 
+    def test_curator_status_probe_requires_local_hermes_context(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "curator_v2": {"command": "/usr/local/bin/curatormd-v2-mcp"},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda *args, **kwargs: pytest.fail("server must not be launched"),
+        )
+        args = _make_args(name="curator_v2")
+        args.probe_curator_status = True
+        assert cmd_mcp_test(args) == 1
+        assert "requires the opted-in local stdio" in capsys.readouterr().out
+
+
+    def test_curator_status_probe_reports_bounded_read_result(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "curator_v2": {
+                "command": "/usr/local/bin/curatormd-v2-mcp",
+                "hermes_context": True,
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        seen = {}
+
+        def probe(name, config, **kwargs):
+            seen["name"] = name
+            seen["config"] = config
+            seen.update(kwargs)
+            kwargs["probe_result"].update(
+                {"is_error": False, "text": '{"goal_count":1,"fact_count":2}'}
+            )
+            return [("project_activity_status", "Read-only status")]
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", probe)
+        args = _make_args(name="curator_v2")
+        args.probe_curator_status = True
+        assert cmd_mcp_test(args) == 0
+        output = capsys.readouterr().out
+        assert "Curator V2 project activity status returned with Hermes context" in output
+        assert '{"goal_count":1,"fact_count":2}' in output
+        assert seen["curator_status_probe"] is True
+        assert seen["probe_session_id"].startswith("curator-status-probe-")
+
+
+    def test_local_hermes_context_is_not_reported_as_auth_none(self, tmp_path, capsys, monkeypatch):
+        """Describe host-injected stdio context without claiming human authentication."""
+        _seed_config(tmp_path, {
+            "curator_v2": {
+                "command": "/usr/local/bin/curatormd-v2-mcp",
+                "hermes_context": True,
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", lambda name, cfg, **kw: [])
+        assert cmd_mcp_test(_make_args(name="curator_v2")) == 0
+        output = capsys.readouterr().out
+        assert "Context: Hermes profile/session (host-injected; local stdio)" in output
+        assert "Auth: none" not in output
+
+    def test_remote_hermes_context_flag_does_not_claim_host_context(self, tmp_path, capsys, monkeypatch):
+        """The host context mechanism is restricted to configured local stdio servers."""
+        _seed_config(tmp_path, {
+            "remote": {"url": "https://mcp.example.com", "hermes_context": True},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", lambda name, cfg, **kw: [])
+        assert cmd_mcp_test(_make_args(name="remote")) == 0
+        output = capsys.readouterr().out
+        assert "Context: Hermes profile/session" not in output
+        assert "Auth: none" in output
+
+
     def test_exit_codes_distinguish_failure_from_unknown_server(self, tmp_path, capsys, monkeypatch):
         """0 connected, 1 connection failed, 3 not in config — never argparse's 2, never a silent 0."""
         _seed_config(tmp_path, {"ink": {"url": "https://mcp.ml.ink/mcp"}})
@@ -645,6 +722,58 @@ class TestProbeCapabilityGating:
         caps = self._Caps(prompts=object(), resources=object())
         called, _details = self._run_probe(monkeypatch, {"url": "http://x/mcp"}, caps)
         assert set(called) == {"prompts", "resources"}
+
+
+class TestCuratorStatusProbe:
+    """The explicit diagnostic sends only host-constructed context to the fixed read tool."""
+
+    def test_probe_invokes_curator_status_with_hermes_host_metadata(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import hermes_cli.mcp_config as mc
+
+        calls = []
+        metadata = {
+            "hermes/profile_id": "renew-ssl-coding",
+            "hermes/session_id": "curator-status-probe-test",
+        }
+
+        class _Session:
+            async def call_tool(self, name, *, arguments, meta):
+                calls.append((name, arguments, meta))
+                return SimpleNamespace(
+                    isError=False,
+                    content=[SimpleNamespace(text='{"goal_count":1}')],
+                )
+
+        class _Server:
+            _tools = [SimpleNamespace(name="project_activity_status", description="Read status")]
+            session = _Session()
+
+            async def shutdown(self):
+                return None
+
+        async def _connect_server(name, config):
+            assert name == "curator_v2"
+            return _Server()
+
+        monkeypatch.setattr("tools.mcp_tool_discovery._connect_server", _connect_server)
+        monkeypatch.setattr(
+            "tools.mcp_tool_handlers._trusted_hermes_request_meta",
+            lambda name, kwargs: metadata
+            if name == "curator_v2" and kwargs["session_id"] == "curator-status-probe-test"
+            else None,
+        )
+        result = {}
+        mc._probe_single_server(
+            "curator_v2",
+            {"command": "curatormd-v2-mcp", "hermes_context": True},
+            curator_status_probe=True,
+            probe_result=result,
+            probe_session_id="curator-status-probe-test",
+        )
+        assert calls == [("project_activity_status", {}, metadata)]
+        assert result == {"is_error": False, "text": '{"goal_count":1}'}
 
 
 class TestStripBearerPrefix:

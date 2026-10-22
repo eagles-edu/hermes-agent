@@ -48,6 +48,14 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
 
     mcp_test_p = mcp_sub.add_parser("test", help="Test MCP server connection")
     mcp_test_p.add_argument("name", help="Server name to test")
+    mcp_test_p.add_argument(
+        "--probe-curator-status",
+        action="store_true",
+        help=(
+            "Call Curator V2's read-only project activity status with Hermes-injected "
+            "profile/session context (curator_v2 local stdio only)"
+        ),
+    )
 
     mcp_cfg_p = mcp_sub.add_parser("configure", aliases=["config"], help="Toggle tool selection")
     mcp_cfg_p.add_argument("name", help="Server name to configure")

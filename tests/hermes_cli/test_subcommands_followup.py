@@ -35,3 +35,5 @@ def test_mcp_and_acp_accept_hooks_flag():
     # acp takes --accept-hooks at top level
     ns = parser.parse_args(["acp", "--accept-hooks"])
     assert ns.accept_hooks is True
+    mcp_ns = parser.parse_args(["mcp", "test", "curator_v2", "--probe-curator-status"])
+    assert mcp_ns.probe_curator_status is True

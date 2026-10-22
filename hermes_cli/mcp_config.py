@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.config import (
@@ -413,7 +414,14 @@ def _resolve_mcp_server_config(config: dict) -> dict:
 
 
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
+    name: str,
+    config: dict,
+    connect_timeout: Optional[float] = None,
+    *,
+    details: Optional[dict] = None,
+    curator_status_probe: bool = False,
+    probe_result: Optional[dict] = None,
+    probe_session_id: Optional[str] = None,
 ) -> list[tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
@@ -473,6 +481,35 @@ def _probe_single_server(
                 if len(desc) > 80:
                     desc = desc[:77] + "..."
                 tools_found.append((t.name, desc))
+            if curator_status_probe:
+                if name != "curator_v2" or not any(
+                    tool_name == "project_activity_status" for tool_name, _ in tools_found
+                ):
+                    raise RuntimeError("Configured Curator V2 activity-status tool is unavailable")
+                if probe_session_id is None or probe_result is None:
+                    raise RuntimeError("Curator V2 status probe context is unavailable")
+                from tools.mcp_tool_handlers import _trusted_hermes_request_meta
+
+                metadata = _trusted_hermes_request_meta(
+                    name, {"session_id": probe_session_id}
+                )
+                if metadata is None:
+                    raise RuntimeError("Curator V2 trusted Hermes context is unavailable")
+                status_result = await server.session.call_tool(
+                    "project_activity_status", arguments={}, meta=metadata
+                )
+                is_error = bool(getattr(status_result, "isError", False))
+                content = getattr(status_result, "content", []) or []
+                text_parts = [
+                    item.text
+                    for item in content
+                    if isinstance(getattr(item, "text", None), str)
+                ]
+                status_text = "\n".join(text_parts)
+                if len(status_text.encode("utf-8")) > 4096:
+                    raise RuntimeError("Curator V2 status response exceeded the CLI display bound")
+                probe_result["is_error"] = is_error
+                probe_result["text"] = status_text
             if details is not None:
                 # Per-tool registry-schema sizes (the SAME converted schema the agent registers) so
                 # the desktop can estimate per-call token cost. Best-effort, absent on failure.
@@ -844,6 +881,16 @@ def cmd_mcp_test(args):
     cfg = _lookup_server(name, _get_mcp_servers(), "Available")
     if cfg is None:
         return 3
+    probe_curator_status = bool(getattr(args, "probe_curator_status", False))
+    if probe_curator_status and (
+        name != "curator_v2"
+        or cfg.get("hermes_context") is not True
+        or not isinstance(cfg.get("command"), str)
+        or not cfg.get("command", "").strip()
+        or cfg.get("url")
+    ):
+        _error("Curator status probe requires the opted-in local stdio curator_v2 server")
+        return 1
     print()
     print(color(f"  Testing '{name}'...", Colors.CYAN))
     if "url" in cfg:
@@ -854,6 +901,13 @@ def cmd_mcp_test(args):
     headers = cfg.get("headers", {})
     if cfg.get("auth", "") == "oauth":
         _info("Auth: OAuth 2.0")
+    elif (
+        cfg.get("hermes_context") is True
+        and isinstance(cfg.get("command"), str)
+        and bool(cfg["command"].strip())
+        and not cfg.get("url")
+    ):
+        _info("Context: Hermes profile/session (host-injected; local stdio)")
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
@@ -864,8 +918,19 @@ def cmd_mcp_test(args):
         _info("Auth: none")
 
     start = time.monotonic()
+    probe_result: dict[str, Any] = {}
     try:
-        tools = _probe_single_server(name, cfg)
+        tools = _probe_single_server(
+            name,
+            cfg,
+            curator_status_probe=probe_curator_status,
+            probe_result=probe_result if probe_curator_status else None,
+            probe_session_id=(
+                f"curator-status-probe-{uuid.uuid4().hex}"
+                if probe_curator_status
+                else None
+            ),
+        )
     except Exception as exc:
         elapsed = time.monotonic() - start
         _error(f"Connection failed ({elapsed:.1f}s): {_probe_failure_reason(exc)}")
@@ -873,6 +938,13 @@ def cmd_mcp_test(args):
         return 1
     _success(f"Connected ({(time.monotonic() - start) * 1000:.0f}ms)")
     _success(f"Tools discovered: {len(tools)}")
+    if probe_curator_status:
+        if probe_result.get("is_error"):
+            _error("Curator V2 rejected the Hermes-context status probe")
+            _info(str(probe_result.get("text", ""))[:4096])
+            return 1
+        _success("Curator V2 project activity status returned with Hermes context")
+        _info(str(probe_result.get("text", ""))[:4096])
     if tools:
         print()
         _print_tools(tools, 36, 55)
