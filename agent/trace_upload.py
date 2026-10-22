@@ -34,6 +34,9 @@ _NO_TOKEN_MESSAGE = (
     "3. Run /upload-trace again (or `hermes trace upload`)."
 )
 _TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN")
+_CURATOR_V2_TOOL_PREFIX = "mcp__curator_v2__"
+_CURATOR_V2_REDACTED_ARGUMENTS = {"_redacted": "[Curator V2 tool arguments omitted]"}
+_CURATOR_V2_REDACTED_RESULT = "[Curator V2 tool result omitted]"
 
 
 class TraceRedactionError(RuntimeError):
@@ -88,6 +91,12 @@ def _parse_tool_args(raw_args: Any) -> dict[str, Any]:
         return {"_raw": raw_args}
 
 
+def _is_curator_v2_tool(tool_name: Any) -> bool:
+    """Identify tool names produced by Hermes' Curator V2 MCP namespace."""
+
+    return isinstance(tool_name, str) and tool_name.startswith(_CURATOR_V2_TOOL_PREFIX)
+
+
 def _tool_calls_to_blocks(tool_calls: Any, redact: bool) -> list[dict[str, Any]]:
     """Convert OpenAI tool_calls into Anthropic ``tool_use`` content blocks."""
     blocks: list[dict[str, Any]] = []
@@ -95,15 +104,18 @@ def _tool_calls_to_blocks(tool_calls: Any, redact: bool) -> list[dict[str, Any]]
         if not isinstance(tc, dict):
             continue
         fn = tc.get("function") or {}
+        tool_name = fn.get("name") or tc.get("name") or "tool"
         parsed = _parse_tool_args(fn.get("arguments"))
-        if redact:
+        if _is_curator_v2_tool(tool_name):
+            parsed = dict(_CURATOR_V2_REDACTED_ARGUMENTS)
+        elif redact:
             try:
                 parsed = json.loads(_redact(json.dumps(parsed), redact))
             except (json.JSONDecodeError, ValueError):
                 logger.warning("Trace upload redacted tool arguments are not valid JSON; refusing upload")
                 raise TraceRedactionError(_REDACTION_BLOCKED_MESSAGE)
         blocks.append({"type": "tool_use", "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:16]}",
-                       "name": fn.get("name") or tc.get("name") or "tool", "input": parsed})
+                       "name": tool_name, "input": parsed})
     return blocks
 
 
@@ -127,9 +139,15 @@ def _assistant_message(msg: dict[str, Any], model: str, redact: bool) -> dict[st
 
 def _tool_result_message(msg: dict[str, Any], model: str, redact: bool) -> dict[str, Any]:
     content = msg.get("content")
+    tool_name = msg.get("tool_name") or msg.get("name")
+    result = (
+        _CURATOR_V2_REDACTED_RESULT
+        if _is_curator_v2_tool(tool_name)
+        else _redact(content if isinstance(content, str) else json.dumps(content), redact)
+    )
     return {"role": "user", "content": [{
         "type": "tool_result", "tool_use_id": msg.get("tool_call_id") or msg.get("tool_name") or "tool",
-        "content": _redact(content if isinstance(content, str) else json.dumps(content), redact),
+        "content": result,
     }]}
 
 

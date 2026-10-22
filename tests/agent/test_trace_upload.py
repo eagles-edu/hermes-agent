@@ -98,6 +98,62 @@ def test_converter_keeps_secrets_when_redact_disabled():
     assert secret in jsonl
 
 
+def test_curator_v2_tool_content_is_omitted_even_when_redaction_is_disabled():
+    argument_canary = "CURATOR_TRACE_ARGUMENT_PRIVATE_CANARY"
+    result_canary = "CURATOR_TRACE_RESULT_PRIVATE_CANARY"
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "curator-call",
+                    "function": {
+                        "name": "mcp__curator_v2__fact_record",
+                        "arguments": json.dumps({"bullet": argument_canary}),
+                    },
+                },
+                {
+                    "id": "ordinary-call",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command": "ordinary-argument"}',
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "curator-call",
+            "tool_name": "mcp__curator_v2__fact_record",
+            "content": result_canary,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "ordinary-call",
+            "tool_name": "terminal",
+            "content": "ordinary-result",
+        },
+    ]
+
+    jsonl = build_trace_jsonl(messages, session_id="s1", redact=False)
+
+    assert argument_canary not in jsonl
+    assert result_canary not in jsonl
+    lines = [json.loads(line) for line in jsonl.strip().splitlines()]
+    tools = lines[0]["message"]["content"]
+    curator_call = next(block for block in tools if block.get("id") == "curator-call")
+    ordinary_call = next(block for block in tools if block.get("id") == "ordinary-call")
+    assert curator_call["name"] == "mcp__curator_v2__fact_record"
+    assert curator_call["input"] == {
+        "_redacted": "[Curator V2 tool arguments omitted]"
+    }
+    assert ordinary_call["input"] == {"command": "ordinary-argument"}
+    assert lines[1]["message"]["content"][0]["content"] == (
+        "[Curator V2 tool result omitted]"
+    )
+    assert lines[2]["message"]["content"][0]["content"] == "ordinary-result"
+
+
 def test_load_session_messages_closes_database_on_failure(monkeypatch):
     db = MagicMock()
     db.resolve_session_id.side_effect = RuntimeError("read failed")

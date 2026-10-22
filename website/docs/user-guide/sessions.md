@@ -471,7 +471,7 @@ hermes sessions export --format trace --session-id 20250305_091523_a1b2c3d4 trac
 hermes sessions export --format trace --session-id 20250305_091523_a1b2c3d4 --upload
 ```
 
-Trace exports are secret-redacted by default (they're meant to leave the machine); `--no-redact` opts out after manual review. `--upload` is private unless `--public`. Bulk trace export with filters writes one `<id>.trace.jsonl` per session.
+Trace exports are secret-redacted by default (they're meant to leave the machine); `--no-redact` opts out after manual review. Curator V2 MCP tool arguments and results are always omitted from traces, including with `--no-redact`. `--upload` is private unless `--public`. Bulk trace export with filters writes one `<id>.trace.jsonl` per session.
 
 #### Markdown / QMD
 

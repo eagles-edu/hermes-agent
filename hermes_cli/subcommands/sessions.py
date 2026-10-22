@@ -7,6 +7,11 @@ from typing import Callable
 
 from hermes_cli.subcommands._shared import add_json_flag, add_yes_flag
 
+_TRACE_NO_REDACT_HELP = (
+    "trace only: skip forced secret redaction after manual review; "
+    "Curator V2 tool arguments/results are still omitted"
+)
+
 
 def _flag(parser, *names, help, **kw):
     parser.add_argument(*names, action="store_true", help=help, **kw)
@@ -98,7 +103,7 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     _flag(sessions_export, "--public",
         help="trace --upload only: create/update a public dataset instead of private")
     _flag(sessions_export, "--no-redact",
-        help=("trace only: skip the forced secret redaction; only use after manual review"))
+        help=_TRACE_NO_REDACT_HELP)
     sessions_export.add_argument("--only", choices=["user-prompts"],
         help="Export only a filtered view (user-prompts: one prompt record "
             "per line for jsonl, headed sections for md)")
