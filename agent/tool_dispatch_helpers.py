@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.compression_marker import _COMPRESSION_MARKER_ARTIFACT_RE
 from agent.message_metadata import stamp_message_timestamp
+from agent.tool_argument_log_safety import tool_arguments_log_excerpt
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     tool_may_have_side_effect,
@@ -191,7 +192,7 @@ def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, lis
         _raw = tool_call.function.arguments
         logging.debug(
             "Could not parse args for %s — treating as sequential barrier; raw=%s",
-            tool_name, _raw[:200] if isinstance(_raw, str) else repr(_raw)[:200],
+            tool_name, tool_arguments_log_excerpt(tool_name, _raw, 200),
         )
         return None
     if not isinstance(function_args, dict):
