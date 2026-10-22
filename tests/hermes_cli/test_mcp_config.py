@@ -312,17 +312,29 @@ class TestMcpTest:
             seen["config"] = config
             seen.update(kwargs)
             kwargs["probe_result"].update(
-                {"is_error": False, "text": '{"goal_count":1,"fact_count":2}'}
+                {
+                    "is_error": False,
+                    "text": '{"goal_count":1,"fact_count":2}',
+                    "goal_list_total": 1,
+                    "health_status": "unknown",
+                    "health_gate_codes": ["dependency_unknown:event_router"],
+                }
             )
-            return [("project_activity_status", "Read-only status")]
+            return [
+                ("project_activity_status", "Read-only status"),
+                ("goal_list_page", "Bounded goal cards"),
+                ("project_health", "Bounded readiness summary"),
+            ]
 
         monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", probe)
         args = _make_args(name="curator_v2")
         args.probe_curator_status = True
         assert cmd_mcp_test(args) == 0
         output = capsys.readouterr().out
-        assert "Curator V2 project activity status returned with Hermes context" in output
+        assert "Curator V2 ledger reads returned with Hermes context" in output
         assert '{"goal_count":1,"fact_count":2}' in output
+        assert "Paginated goal-list total: 1" in output
+        assert "Project health: unknown (gates: dependency_unknown:event_router)" in output
         assert seen["curator_status_probe"] is True
         assert seen["probe_session_id"].startswith("curator-status-probe-")
 
@@ -376,6 +388,13 @@ class TestMcpTest:
     def test_cli_dispatcher_forwards_test_exit_code(self, tmp_path, monkeypatch):
         """``hermes mcp test`` reaches ``main()`` with the handler's code (the dispatcher used to drop it)."""
         _seed_config(tmp_path, {"ink": {"url": "https://mcp.ml.ink/mcp"}})
+        import sys
+        from types import ModuleType
+
+        # This test exercises command dispatch, not the install bootstrap. The
+        # source checkout's bootstrap resolves its adjacent sealed-payload
+        # manifest, which is outside the isolated HERMES_HOME used by the test.
+        monkeypatch.setitem(sys.modules, "hermes_bootstrap", ModuleType("hermes_bootstrap"))
         from hermes_cli.main import cmd_mcp
 
         def failing_probe(name, cfg, **kw):
@@ -741,13 +760,31 @@ class TestCuratorStatusProbe:
         class _Session:
             async def call_tool(self, name, *, arguments, meta):
                 calls.append((name, arguments, meta))
+                responses = {
+                    "project_activity_status": (
+                        '{"project_id":"vhost-manager-alpha","goal_count":1}'
+                    ),
+                    "goal_list_page": (
+                        '{"project_id":"vhost-manager-alpha","total":1,'
+                        '"goals":[{"problem":"private"}]}'
+                    ),
+                    "project_health": (
+                        '{"project_id":"vhost-manager-alpha","status":"unknown",'
+                        '"gate_codes":["dependency_unknown:event_router"]}'
+                    ),
+                }
+                response = responses[name]
                 return SimpleNamespace(
                     isError=False,
-                    content=[SimpleNamespace(text='{"goal_count":1}')],
+                    content=[SimpleNamespace(text=response)],
                 )
 
         class _Server:
-            _tools = [SimpleNamespace(name="project_activity_status", description="Read status")]
+            _tools = [
+                SimpleNamespace(name="project_activity_status", description="Read status"),
+                SimpleNamespace(name="goal_list_page", description="List goals"),
+                SimpleNamespace(name="project_health", description="Read health"),
+            ]
             session = _Session()
 
             async def shutdown(self):
@@ -767,13 +804,40 @@ class TestCuratorStatusProbe:
         result = {}
         mc._probe_single_server(
             "curator_v2",
-            {"command": "curatormd-v2-mcp", "hermes_context": True},
+            {
+                "command": "curatormd-v2-mcp",
+                "hermes_context": True,
+                "hermes_project_id": "vhost-manager-alpha",
+            },
             curator_status_probe=True,
             probe_result=result,
             probe_session_id="curator-status-probe-test",
         )
-        assert calls == [("project_activity_status", {}, metadata)]
-        assert result == {"is_error": False, "text": '{"goal_count":1}'}
+        assert calls == [
+            ("project_activity_status", {}, metadata),
+            ("goal_list_page", {"offset": 0, "limit": 1}, metadata),
+            ("project_health", {}, metadata),
+        ]
+        assert result == {
+            "is_error": False,
+            "text": '{"project_id":"vhost-manager-alpha","goal_count":1}',
+            "goal_list_total": 1,
+            "health_status": "unknown",
+            "health_gate_codes": ["dependency_unknown:event_router"],
+        }
+        assert "private" not in repr(result)
+        with pytest.raises(RuntimeError, match="configured Hermes project"):
+            mc._probe_single_server(
+                "curator_v2",
+                {
+                    "command": "curatormd-v2-mcp",
+                    "hermes_context": True,
+                    "hermes_project_id": "other-project",
+                },
+                curator_status_probe=True,
+                probe_result={},
+                probe_session_id="curator-status-probe-test",
+            )
 
 
 class TestStripBearerPrefix:

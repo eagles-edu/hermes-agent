@@ -93,9 +93,13 @@ You can verify MCP in a few ways:
   argparse's usage error), so health probes and cron watchdogs can branch on
   `$?` instead of parsing the output
 - for the local Curator V2 stdio integration, append
-  `--probe-curator-status` to run its fixed read-only activity-status call with
-  Hermes-injected profile/session context. This checks the profile-to-ledger
-  path; it does not authenticate a human user or prove production readiness.
+  `--probe-curator-status` to run fixed read-only activity, paginated goal-list,
+  and project-health reads with Hermes-injected profile/session context. It
+  displays activity aggregates, the goal total, health state, and bounded gate
+  codes while suppressing goal-card content. This checks the profile-to-ledger
+  read path and verifies that each response is scoped to the profile's
+  configured `hermes_project_id`; it does not authenticate a human user or
+  prove production readiness.
 
 A practical test prompt:
 

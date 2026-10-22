@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -413,6 +414,101 @@ def _resolve_mcp_server_config(config: dict) -> dict:
     return _interpolate_env_vars(config)
 
 
+async def _curator_probe_call(
+    server: Any,
+    tool_name: str,
+    arguments: dict[str, Any],
+    metadata: dict[str, Any],
+) -> tuple[bool, str]:
+    """Call one fixed read-only Curator tool and bound its text response."""
+    result = await server.session.call_tool(tool_name, arguments=arguments, meta=metadata)
+    is_error = bool(getattr(result, "isError", False))
+    content = getattr(result, "content", []) or []
+    text = "\n".join(
+        item.text
+        for item in content
+        if isinstance(getattr(item, "text", None), str)
+    )
+    if len(text.encode("utf-8")) > 4096:
+        raise RuntimeError("Curator V2 status response exceeded the CLI display bound")
+    return is_error, text
+
+
+async def _probe_curator_ledger(
+    server: Any,
+    tools_found: list[tuple[str, str]],
+    session_id: str,
+    expected_project_id: str,
+) -> dict[str, Any]:
+    """Read bounded activity, goal, and health summaries using Hermes context."""
+    if not isinstance(expected_project_id, str) or not expected_project_id:
+        raise RuntimeError("Curator V2 Hermes project binding is unavailable")
+    available = {tool_name for tool_name, _ in tools_found}
+    required = {"project_activity_status", "goal_list_page", "project_health"}
+    if not required <= available:
+        raise RuntimeError("Configured Curator V2 status tools are unavailable")
+    from tools.mcp_tool_handlers import _trusted_hermes_request_meta
+
+    metadata = _trusted_hermes_request_meta("curator_v2", {"session_id": session_id})
+    if metadata is None:
+        raise RuntimeError("Curator V2 trusted Hermes context is unavailable")
+    status_error, status_text = await _curator_probe_call(
+        server, "project_activity_status", {}, metadata
+    )
+    goals_error, goals_text = await _curator_probe_call(
+        server, "goal_list_page", {"offset": 0, "limit": 1}, metadata
+    )
+    health_error, health_text = await _curator_probe_call(
+        server, "project_health", {}, metadata
+    )
+    if status_error or goals_error or health_error:
+        return {"is_error": True, "text": "Curator V2 rejected a Hermes-context read"}
+    try:
+        status = json.loads(status_text)
+        goals = json.loads(goals_text)
+        health = json.loads(health_text)
+    except (TypeError, ValueError):
+        raise RuntimeError("Curator V2 status response was malformed") from None
+    total = goals.get("total") if isinstance(goals, dict) else None
+    if type(total) is not int or total < 0:  # pylint: disable=unidiomatic-typecheck
+        raise RuntimeError("Curator V2 goal-list response omitted its bounded total")
+    if not isinstance(status, dict):
+        raise RuntimeError("Curator V2 activity response was malformed")
+    if any(
+        not isinstance(response, dict)
+        or response.get("project_id") != expected_project_id
+        for response in (status, goals, health)
+    ):
+        raise RuntimeError("Curator V2 response did not match the configured Hermes project")
+    health_status = health.get("status") if isinstance(health, dict) else None
+    if not isinstance(health_status, str) or health_status not in {
+        "healthy",
+        "degraded",
+        "unknown",
+    }:
+        raise RuntimeError("Curator V2 health response omitted its status")
+    gate_codes = health.get("gate_codes") if isinstance(health, dict) else None
+    if (
+        not isinstance(gate_codes, list)
+        or len(gate_codes) > 128
+        or any(
+            not isinstance(code, str)
+            or re.fullmatch(
+                r"[a-z][a-z0-9_]{0,79}(?::[a-z][a-z0-9_]{0,79})?", code
+            ) is None
+            for code in gate_codes
+        )
+    ):
+        raise RuntimeError("Curator V2 health response contained invalid gate codes")
+    return {
+        "is_error": False,
+        "text": status_text,
+        "goal_list_total": total,
+        "health_status": health_status,
+        "health_gate_codes": gate_codes,
+    }
+
+
 def _probe_single_server(
     name: str,
     config: dict,
@@ -482,34 +578,18 @@ def _probe_single_server(
                     desc = desc[:77] + "..."
                 tools_found.append((t.name, desc))
             if curator_status_probe:
-                if name != "curator_v2" or not any(
-                    tool_name == "project_activity_status" for tool_name, _ in tools_found
-                ):
-                    raise RuntimeError("Configured Curator V2 activity-status tool is unavailable")
                 if probe_session_id is None or probe_result is None:
                     raise RuntimeError("Curator V2 status probe context is unavailable")
-                from tools.mcp_tool_handlers import _trusted_hermes_request_meta
-
-                metadata = _trusted_hermes_request_meta(
-                    name, {"session_id": probe_session_id}
+                if name != "curator_v2":
+                    raise RuntimeError("Curator V2 status probe requires curator_v2")
+                probe_result.update(
+                    await _probe_curator_ledger(
+                        server,
+                        tools_found,
+                        probe_session_id,
+                        config.get("hermes_project_id"),
+                    )
                 )
-                if metadata is None:
-                    raise RuntimeError("Curator V2 trusted Hermes context is unavailable")
-                status_result = await server.session.call_tool(
-                    "project_activity_status", arguments={}, meta=metadata
-                )
-                is_error = bool(getattr(status_result, "isError", False))
-                content = getattr(status_result, "content", []) or []
-                text_parts = [
-                    item.text
-                    for item in content
-                    if isinstance(getattr(item, "text", None), str)
-                ]
-                status_text = "\n".join(text_parts)
-                if len(status_text.encode("utf-8")) > 4096:
-                    raise RuntimeError("Curator V2 status response exceeded the CLI display bound")
-                probe_result["is_error"] = is_error
-                probe_result["text"] = status_text
             if details is not None:
                 # Per-tool registry-schema sizes (the SAME converted schema the agent registers) so
                 # the desktop can estimate per-call token cost. Best-effort, absent on failure.
@@ -943,8 +1023,11 @@ def cmd_mcp_test(args):
             _error("Curator V2 rejected the Hermes-context status probe")
             _info(str(probe_result.get("text", ""))[:4096])
             return 1
-        _success("Curator V2 project activity status returned with Hermes context")
+        _success("Curator V2 ledger reads returned with Hermes context")
         _info(str(probe_result.get("text", ""))[:4096])
+        _info(f"Paginated goal-list total: {probe_result['goal_list_total']}")
+        gates = ", ".join(probe_result["health_gate_codes"]) or "none"
+        _info(f"Project health: {probe_result['health_status']} (gates: {gates})")
     if tools:
         print()
         _print_tools(tools, 36, 55)

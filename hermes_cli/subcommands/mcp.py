@@ -52,7 +52,7 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         "--probe-curator-status",
         action="store_true",
         help=(
-            "Call Curator V2's read-only project activity status with Hermes-injected "
+            "Read Curator V2 activity, paginated goal totals, and project health with Hermes-injected "
             "profile/session context (curator_v2 local stdio only)"
         ),
     )
