@@ -152,6 +152,15 @@ class GatewayTurnProgressMixin:
     def progress_callback(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args: dict | None = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if event_type == "tool.started" and isinstance(tool_name, str):
+            from agent.tool_argument_log_safety import (
+                is_curator_v2_tool,
+                tool_arguments_log_excerpt,
+            )
+
+            if is_curator_v2_tool(tool_name):
+                preview = tool_arguments_log_excerpt(tool_name, args, 0)
+                args = None
         if local_viewer_turn(self):
             try:
                 from gateway import local_viewer_events
