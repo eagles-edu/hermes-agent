@@ -190,7 +190,8 @@ class TestTrustGateAtCallTime:
                 {"goal_id": "goal-1"},
                 {"session_id": "session-1"},
                 SimpleNamespace(
-                    isError=False, structuredContent={"source_epoch": 1}
+                    isError=False,
+                    structuredContent={"result": '{"source_epoch": 1}'},
                 ),
             ) is True
 

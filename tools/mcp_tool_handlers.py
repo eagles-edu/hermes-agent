@@ -151,7 +151,18 @@ def _curator_source_epoch(result: Any) -> Optional[int]:
     structured = mcp_field(result, "structured_content", "structuredContent")
     if isinstance(structured, dict):
         value = structured.get("source_epoch")
-        return value if type(value) is int and value >= 1 else None
+        if type(value) is int and value >= 1:
+            return value
+        nested_result = structured.get("result")
+        if isinstance(nested_result, str):
+            try:
+                nested = json.loads(nested_result)
+            except (TypeError, ValueError):
+                nested = None
+            if isinstance(nested, dict):
+                value = nested.get("source_epoch")
+                if type(value) is int and value >= 1:
+                    return value
     content = mcp_field(result, "content", "content", [])
     if not isinstance(content, list):
         return None
