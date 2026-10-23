@@ -82,6 +82,15 @@ def _trusted_hermes_request_meta(
     if not isinstance(session_id, str) or not session_id or not profile_id:
         raise RuntimeError("Hermes profile or session context is unavailable")
     metadata = {"hermes/profile_id": profile_id, "hermes/session_id": session_id}
+    if server_name == "curator_v2" and config.get("hermes_project_id"):
+        from tools.curator_v2_health import curator_v2_readiness
+
+        metadata["hermes/readiness"] = curator_v2_readiness(
+            config,
+            profile_id=profile_id,
+            session_id=session_id,
+            home=get_hermes_home(),
+        )
     if kwargs.get("hermes_durable_event") is True:
         metadata["hermes/durable_event"] = True
     return metadata
