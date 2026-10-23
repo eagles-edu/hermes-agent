@@ -17,6 +17,8 @@ import yaml
 _PROBED_DEPENDENCIES = (
     "event_router",
     "purge_scheduler",
+    "database_storage_adapter",
+    "alert_delivery",
     "host_identity",
     "human_review",
     "artifact_producer_inventory",
@@ -99,6 +101,18 @@ def _review_grant_ready(database: Path | None, project_id: str) -> bool | None:
         return None
 
 
+def _storage_ready(database: Path | None) -> bool | None:
+    """Probe only that the configured SQLite database can be read consistently."""
+
+    if database is None or not database.is_file():
+        return None
+    try:
+        with closing(_readonly_connection(database)) as connection:
+            return connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    except (OSError, sqlite3.Error):
+        return None
+
+
 def _producer_inventory_ready(home: Path) -> bool | None:
     """Check the installed profile hook manifest is bounded and internally valid."""
 
@@ -130,7 +144,7 @@ def curator_v2_readiness(
     session_id: str,
     home: Path,
 ) -> dict[str, dict[str, Any]]:
-    """Return five bounded observations; no payloads, paths, or identities escape."""
+    """Return seven bounded observations; no payloads, paths, or identities escape."""
 
     observed_at = datetime.now(UTC).isoformat(timespec="seconds")
     project_id = config.get("hermes_project_id")
@@ -143,6 +157,11 @@ def curator_v2_readiness(
         # No scheduler heartbeat/configuration contract exists in this local alpha.
         # False means the required service is known absent, not that its state is unknown.
         "purge_scheduler": _observation(False, observed_at),
+        "database_storage_adapter": _observation(
+            _storage_ready(database), observed_at
+        ),
+        # No alert receiver is configured by this local alpha integration.
+        "alert_delivery": _observation(False, observed_at),
         "host_identity": _observation(
             bool(profile_id and session_id and config.get("hermes_context") is True),
             observed_at,

@@ -52,6 +52,8 @@ def test_curator_readiness_reports_observed_local_state(tmp_path):
 
     assert result["event_router"]["ready"] is True
     assert result["human_review"]["ready"] is True
+    assert result["database_storage_adapter"]["ready"] is True
+    assert result["alert_delivery"]["ready"] is False
     assert result["artifact_producer_inventory"]["ready"] is True
     assert result["host_identity"]["ready"] is True
     assert result["purge_scheduler"]["ready"] is False
@@ -68,6 +70,8 @@ def test_curator_readiness_keeps_missing_probe_sources_unknown(tmp_path):
 
     assert result["event_router"]["ready"] is None
     assert result["human_review"]["ready"] is None
+    assert result["database_storage_adapter"]["ready"] is None
+    assert result["alert_delivery"]["ready"] is False
     assert result["artifact_producer_inventory"]["ready"] is None
     assert result["purge_scheduler"]["ready"] is False
 
@@ -96,6 +100,8 @@ def test_trusted_curator_mcp_metadata_carries_host_probes(tmp_path):
     assert set(metadata["hermes/readiness"]) == {
         "event_router",
         "purge_scheduler",
+        "database_storage_adapter",
+        "alert_delivery",
         "host_identity",
         "human_review",
         "artifact_producer_inventory",
