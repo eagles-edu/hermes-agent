@@ -45,6 +45,14 @@ _PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$")
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$")
 
 
+def _source_id(profile_id: str, project_id: str, source_epoch: int) -> str:
+    """Keep existing queue IDs at epoch one and separate later enrollments."""
+    identity = f"{profile_id}\0{project_id}"
+    if source_epoch > 1:
+        identity += f"\0{source_epoch}"
+    return "hermes-" + hashlib.sha256(identity.encode()).hexdigest()
+
+
 class CodexLifecycleOutbox:
     """SQLite-backed, per-Hermes-profile event outbox."""
 
@@ -87,10 +95,22 @@ class CodexLifecycleOutbox:
                 session_id TEXT NOT NULL,
                 goal_id TEXT NOT NULL,
                 source_id TEXT NOT NULL,
+                source_epoch INTEGER NOT NULL DEFAULT 1 CHECK (source_epoch >= 1),
                 bound_at TEXT NOT NULL,
                 PRIMARY KEY(session_id)
             )"""
         )
+        binding_columns = {
+            row[1]
+            for row in self._connection.execute(
+                "PRAGMA table_info(active_goal_bindings)"
+            ).fetchall()
+        }
+        if "source_epoch" not in binding_columns:
+            self._connection.execute(
+                "ALTER TABLE active_goal_bindings ADD COLUMN "
+                "source_epoch INTEGER NOT NULL DEFAULT 1 CHECK (source_epoch >= 1)"
+            )
         self._connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS active_goal_binding_session "
             "ON active_goal_bindings(session_id)"
@@ -142,11 +162,25 @@ class CodexLifecycleOutbox:
                 session_id TEXT NOT NULL,
                 goal_id TEXT NOT NULL,
                 source_id TEXT NOT NULL,
+                source_epoch INTEGER NOT NULL DEFAULT 1 CHECK (source_epoch >= 1),
                 bound_at TEXT NOT NULL
             )"""
         )
+        history_columns = {
+            row[1]
+            for row in self._connection.execute(
+                "PRAGMA table_info(goal_binding_history)"
+            ).fetchall()
+        }
+        if "source_epoch" not in history_columns:
+            self._connection.execute(
+                "ALTER TABLE goal_binding_history ADD COLUMN "
+                "source_epoch INTEGER NOT NULL DEFAULT 1 CHECK (source_epoch >= 1)"
+            )
 
-    def bind_goal(self, project_id: str, session_id: str, goal_id: str) -> bool:
+    def bind_goal(
+        self, project_id: str, session_id: str, goal_id: str, source_epoch: int = 1
+    ) -> bool:
         """Bind one explicit active goal to this Hermes session, retaining binding history."""
         if (
             not isinstance(project_id, str)
@@ -155,35 +189,42 @@ class CodexLifecycleOutbox:
             or not _SESSION_ID_RE.fullmatch(session_id)
             or not isinstance(goal_id, str)
             or not _PROFILE_ID_RE.fullmatch(goal_id)
+            or type(source_epoch) is not int
+            or source_epoch < 1
         ):
             return False
         profile_id = self.profile_id or Path(self.path).parent.parent.name
         if not _PROFILE_ID_RE.fullmatch(profile_id):
             return False
-        source_id = "hermes-" + hashlib.sha256(
-            f"{profile_id}\0{project_id}".encode()
-        ).hexdigest()
+        source_id = _source_id(profile_id, project_id, source_epoch)
         bound_at = datetime.now(UTC).isoformat(timespec="microseconds")
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 current = self._connection.execute(
-                    "SELECT goal_id FROM active_goal_bindings WHERE project_id = ? AND session_id = ?",
+                    "SELECT goal_id, source_epoch FROM active_goal_bindings "
+                    "WHERE project_id = ? AND session_id = ?",
                     (project_id, session_id),
                 ).fetchone()
+                if current is not None and current[1] != source_epoch:
+                    self._connection.rollback()
+                    return False
                 if current is not None and current[0] == goal_id:
                     self._connection.commit()
                     return True
                 self._connection.execute(
-                    "INSERT INTO goal_binding_history(project_id, session_id, goal_id, source_id, bound_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (project_id, session_id, goal_id, source_id, bound_at),
+                    "INSERT INTO goal_binding_history "
+                    "(project_id, session_id, goal_id, source_id, source_epoch, bound_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (project_id, session_id, goal_id, source_id, source_epoch, bound_at),
                 )
                 self._connection.execute(
-                    "INSERT INTO active_goal_bindings(project_id, session_id, goal_id, source_id, bound_at) "
-                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
-                    "goal_id = excluded.goal_id, source_id = excluded.source_id, bound_at = excluded.bound_at",
-                    (project_id, session_id, goal_id, source_id, bound_at),
+                    "INSERT INTO active_goal_bindings "
+                    "(project_id, session_id, goal_id, source_id, source_epoch, bound_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+                    "goal_id = excluded.goal_id, source_id = excluded.source_id, "
+                    "source_epoch = excluded.source_epoch, bound_at = excluded.bound_at",
+                    (project_id, session_id, goal_id, source_id, source_epoch, bound_at),
                 )
                 self._connection.commit()
             except BaseException:

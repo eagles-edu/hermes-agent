@@ -189,7 +189,9 @@ class TestTrustGateAtCallTime:
                 "goal_activate",
                 {"goal_id": "goal-1"},
                 {"session_id": "session-1"},
-                SimpleNamespace(isError=False),
+                SimpleNamespace(
+                    isError=False, structuredContent={"source_epoch": 1}
+                ),
             ) is True
 
         outbox = CodexLifecycleOutbox(
@@ -211,6 +213,11 @@ class TestTrustGateAtCallTime:
         """Compose HookContext, the managed MCP handler, and the profile outbox."""
         from gateway.codex_outbox import CodexLifecycleOutbox
         from gateway.hooks import HookContext
+
+        fake_session.call_tool.return_value = _FakeCallToolResult(
+            content=[_FakeContentBlock("ok")],
+            structuredContent={"source_epoch": 1},
+        )
 
         home = tmp_path / "profiles" / "renew-ssl-coding"
         _set_trust("srv", "trusted")
@@ -240,6 +247,7 @@ class TestTrustGateAtCallTime:
             "ok": True,
             "result": "ok",
             "hermes_goal_binding": "bound",
+        "structuredContent": {"source_epoch": 1},
         }
         fake_session.call_tool.assert_awaited_once_with(
             "goal_activate",

@@ -119,6 +119,82 @@ class TestDiscoverAndLoad:
 
 class TestEmit:
 
+    def test_new_session_starts_fresh_sequence_and_old_session_keeps_old_source(self, tmp_path):
+        from gateway.codex_outbox import CodexLifecycleOutbox
+
+        outbox = CodexLifecycleOutbox(
+            tmp_path / "codex-outbox.sqlite3", profile_id="hermes-test"
+        )
+        assert outbox.bind_goal("project-1", "old-session", "goal-1", source_epoch=1)
+        old_event = outbox.enqueue(
+            "codex:turn:start",
+            {"attempt_id": "old-attempt", "session_id": "old-session"},
+        )
+        assert old_event is not None
+        assert old_event["source_sequence"] == 1
+
+        assert outbox.bind_goal("project-1", "new-session", "goal-2", source_epoch=2)
+        new_event = outbox.enqueue(
+            "codex:turn:start",
+            {"attempt_id": "new-attempt", "session_id": "new-session"},
+        )
+        assert new_event is not None
+        assert new_event["source_sequence"] == 1
+        assert new_event["source_id"] != old_event["source_id"]
+        assert {event["event_id"] for event in outbox.pending()} == {
+            old_event["event_id"],
+            new_event["event_id"],
+        }
+
+        assert not outbox.bind_goal(
+            "project-1", "old-session", "goal-1", source_epoch=2
+        )
+        assert outbox.enqueue(
+            "codex:turn:start",
+            {"attempt_id": "old-after-reenrollment", "session_id": "old-session"},
+        ) is not None
+        pending = {event["event_id"]: event for event in outbox.pending()}
+        assert pending[old_event["event_id"]] == old_event
+        outbox.close()
+
+    def test_existing_binding_tables_gain_epoch_one_on_open(self, tmp_path):
+        import sqlite3
+
+        from gateway.codex_outbox import CodexLifecycleOutbox
+
+        path = tmp_path / "codex-outbox.sqlite3"
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """CREATE TABLE active_goal_bindings (
+                    project_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    goal_id TEXT NOT NULL, source_id TEXT NOT NULL, bound_at TEXT NOT NULL,
+                    PRIMARY KEY(session_id))"""
+            )
+            connection.execute(
+                """INSERT INTO active_goal_bindings VALUES
+                    ('project-1', 'session-1', 'goal-1', 'legacy-source', 'now')"""
+            )
+            connection.execute(
+                """CREATE TABLE goal_binding_history (
+                    binding_revision INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    goal_id TEXT NOT NULL, source_id TEXT NOT NULL, bound_at TEXT NOT NULL)"""
+            )
+            connection.execute(
+                """INSERT INTO goal_binding_history
+                    (project_id, session_id, goal_id, source_id, bound_at)
+                    VALUES ('project-1', 'session-1', 'goal-1', 'legacy-source', 'now')"""
+            )
+
+        outbox = CodexLifecycleOutbox(path, profile_id="hermes-test")
+        assert outbox._connection.execute(
+            "SELECT source_epoch FROM active_goal_bindings"
+        ).fetchone() == (1,)
+        assert outbox._connection.execute(
+            "SELECT source_epoch FROM goal_binding_history"
+        ).fetchone() == (1,)
+        outbox.close()
+
     def test_existing_project_usage_rows_are_backfilled_with_turn_source(self, tmp_path):
         import sqlite3
 

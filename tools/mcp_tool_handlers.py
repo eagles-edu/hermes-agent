@@ -123,6 +123,9 @@ def _bind_hermes_active_goal(
     profile_id = profile_name_for_home(get_hermes_home())
     if not all(isinstance(value, str) and value for value in (project_id, goal_id, session_id, profile_id)):
         return False
+    source_epoch = _curator_source_epoch(result)
+    if source_epoch is None:
+        return False
     try:
         from gateway.codex_outbox import CodexLifecycleOutbox
 
@@ -131,7 +134,9 @@ def _bind_hermes_active_goal(
             profile_id=profile_id,
         )
         try:
-            return outbox.bind_goal(project_id, session_id, goal_id)
+            return outbox.bind_goal(
+                project_id, session_id, goal_id, source_epoch=source_epoch
+            )
         finally:
             outbox.close()
     except Exception as exc:  # health: allow BLE001 -- binding is best-effort after the durable goal transition.
@@ -139,6 +144,30 @@ def _bind_hermes_active_goal(
         # or invite a duplicate write; surface only a bounded status to the model.
         logger.warning("Curator goal binding was not recorded (%s)", type(exc).__name__)
         return False
+
+
+def _curator_source_epoch(result: Any) -> Optional[int]:
+    """Read a positive source epoch from Curator's bounded JSON tool result."""
+    structured = mcp_field(result, "structured_content", "structuredContent")
+    if isinstance(structured, dict):
+        value = structured.get("source_epoch")
+        return value if type(value) is int and value >= 1 else None
+    content = mcp_field(result, "content", "content", [])
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        text = mcp_field(block, "text", "text")
+        if not isinstance(text, str):
+            continue
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            value = payload.get("source_epoch")
+            if type(value) is int and value >= 1:
+                return value
+    return None
 
 
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
