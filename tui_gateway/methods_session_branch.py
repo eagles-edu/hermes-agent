@@ -45,6 +45,7 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = None  # claimed lazily on the first turn
             _sessions[new_sid]["auth_user_id"] = parent_user_id
+            _sessions[new_sid]["authenticated_subject"] = session.get("authenticated_subject")
             # The parent's STORED key: the idempotent-hit reply for a retried
             # session.branch answers the same ``parent`` as the fresh path, and
             # later readers (lineage, retry) get the linkage from the runtime.

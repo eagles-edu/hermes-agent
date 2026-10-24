@@ -4709,7 +4709,8 @@ class _LoginSocket:
 def _login_session(monkeypatch, sid, key, transport, **extra) -> dict:
     """A record the way session.create stamps it: the login lives on the record, not the transport slot."""
     record = {"session_key": key, "transport": transport,
-              "auth_user_id": server._transport_auth_user_id(transport), **extra}
+              "auth_user_id": server._transport_auth_user_id(transport),
+              "authenticated_subject": server._transport_authenticated_subject(transport), **extra}
     monkeypatch.setitem(server._sessions, sid, record)
     return record
 
@@ -4752,6 +4753,7 @@ def test_build_branch_agent_carries_the_parent_login(monkeypatch, tmp_path):
 
     assert captured["user_id"] == "basic:alice"
     assert server._sessions["sid-branch"]["auth_user_id"] == "basic:alice"
+    assert server._sessions["sid-branch"]["authenticated_subject"] == 'auth:v1:["basic","","alice"]'
 
 
 def test_deferred_session_record_stamps_the_creating_login():
@@ -4763,7 +4765,21 @@ def test_deferred_session_record_stamps_the_creating_login():
         reset_transport(token)
 
     assert record["auth_user_id"] == "oidc:carol"
+    assert record["authenticated_subject"] == 'auth:v1:["oidc","","carol"]'
     assert server._session_auth_user_id(record) == "oidc:carol"
+
+
+def test_mcp_subject_lookup_is_bound_to_the_session_profile_home(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    subject = 'auth:v1:["oidc","","carol"]'
+    monkeypatch.setitem(server._sessions, "sid-profile", {
+        "profile_home": str(profile_home),
+        "authenticated_subject": subject,
+    })
+
+    assert server._session_authenticated_subject("sid-profile", str(profile_home)) == subject
+    assert server._session_authenticated_subject("sid-profile", str(tmp_path / "other")) is None
 
 
 def test_compute_host_turn_frame_carries_the_session_login(monkeypatch):

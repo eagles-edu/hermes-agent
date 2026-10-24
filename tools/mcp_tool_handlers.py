@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import inspect
 import json
+import sys
 import time
 from contextlib import asynccontextmanager
 from functools import partial
@@ -82,6 +83,18 @@ def _trusted_hermes_request_meta(
     if not isinstance(session_id, str) or not session_id or not profile_id:
         raise RuntimeError("Hermes profile or session context is unavailable")
     metadata = {"hermes/profile_id": profile_id, "hermes/session_id": session_id}
+    # The gateway registry is already loaded in an authenticated runtime. Do
+    # not import it from a tool handler: server import initializes the full
+    # gateway and is unsafe in isolated MCP/unit-test contexts.
+    tui_server = sys.modules.get("tui_gateway.server")
+    subject_lookup = getattr(tui_server, "_session_authenticated_subject", None)
+    authenticated_subject = (
+        subject_lookup(session_id, str(get_hermes_home()))
+        if callable(subject_lookup)
+        else None
+    )
+    if authenticated_subject is not None:
+        metadata["hermes/authenticated_subject"] = authenticated_subject
     if server_name == "curator_v2" and config.get("hermes_project_id"):
         from tools.curator_v2_health import curator_v2_readiness
 

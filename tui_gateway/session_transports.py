@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from tui_gateway.method_ctx import bind_module
 
 # Leaf lock: callers may hold sessions/history locks, never acquire them here.
@@ -43,6 +44,40 @@ def _transport_auth_user_id(transport) -> str | None:
     if _methods_browser_control._is_authenticated_identity(identity):
         return f"{str(identity['provider']).strip()}:{str(identity['user_id']).strip()}"
     return None
+
+
+def _transport_authenticated_subject(transport) -> str | None:
+    """Canonicalize only a server-validated WebSocket login identity."""
+
+    identity = getattr(transport, "auth_identity", None)
+    if not _methods_browser_control._is_authenticated_identity(identity):
+        return None
+    from gateway.session_identity import authenticated_subject
+
+    subject = authenticated_subject(identity)
+    return subject if isinstance(subject, str) and subject != "unbound" else None
+
+
+def _session_authenticated_subject(
+    session_id: str,
+    expected_profile_home: str,
+) -> str | None:
+    """Return the session creator's subject only inside the pinned profile home."""
+
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+        if not isinstance(session, dict):
+            return None
+        from hermes_constants import get_hermes_home
+
+        session_home = session.get("profile_home") or str(get_hermes_home())
+        try:
+            if Path(session_home).resolve() != Path(expected_profile_home).resolve():
+                return None
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        subject = session.get("authenticated_subject")
+        return subject if isinstance(subject, str) else None
 
 
 def _session_auth_user_id(session: dict | None) -> str | None:

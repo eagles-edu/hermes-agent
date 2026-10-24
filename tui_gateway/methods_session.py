@@ -432,7 +432,8 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
-            "auth_user_id": _transport_auth_user_id(current_transport())}
+            "auth_user_id": _transport_auth_user_id(current_transport()),
+            "authenticated_subject": _transport_authenticated_subject(current_transport())}
         _register_session_cwd(_sessions[sid])
         if idem_key is not None:
             _idempotency_keys[idem_key] = (sid, now)

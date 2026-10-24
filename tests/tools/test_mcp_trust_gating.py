@@ -19,6 +19,7 @@ Adversarial notes encoded in these tests:
 
 import asyncio
 import json
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -294,6 +295,26 @@ class TestTrustGateAtCallTime:
                 "hermes/profile_id": "gptmd-coding",
                 "hermes/session_id": "session-17",
                 "hermes/durable_event": True,
+            }
+
+        subject = 'auth:v1:["oidc","https://issuer.example","user-42"]'
+        with patch(
+            "hermes_cli.mcp_config._get_mcp_servers",
+            return_value={"srv": {"command": "curator", "hermes_context": True}},
+        ), patch("hermes_constants.get_hermes_home", return_value="/profiles/gptmd-coding"), patch(
+            "hermes_constants.profile_name_for_home", return_value="gptmd-coding"
+        ), patch.dict(
+            sys.modules,
+            {"tui_gateway.server": SimpleNamespace(
+                _session_authenticated_subject=lambda session, home: (
+                    subject if (session, home) == ("session-17", "/profiles/gptmd-coding") else None
+                )
+            )},
+        ):
+            assert _trusted_hermes_request_meta("srv", {"session_id": "session-17"}) == {
+                "hermes/profile_id": "gptmd-coding",
+                "hermes/session_id": "session-17",
+                "hermes/authenticated_subject": subject,
             }
 
         with patch(
