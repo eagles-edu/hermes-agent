@@ -480,6 +480,35 @@ async def _probe_curator_ledger(
         for response in (status, goals, health)
     ):
         raise RuntimeError("Curator V2 response did not match the configured Hermes project")
+    lifecycle_rows = status.get("goal_status_counts")
+    expected_statuses = {
+        "planned", "active", "complete", "open", "blocked", "deferred",
+        "cancelled", "superseded",
+    }
+    if not isinstance(lifecycle_rows, list) or len(lifecycle_rows) != len(expected_statuses):
+        raise RuntimeError("Curator V2 activity response omitted lifecycle counts")
+    lifecycle_counts: dict[str, int] = {}
+    for row in lifecycle_rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("Curator V2 lifecycle counts were malformed")
+        name, count = row.get("status"), row.get("count")
+        if (
+            not isinstance(name, str)
+            or name not in expected_statuses
+            or type(count) is not int
+            or count < 0
+            or name in lifecycle_counts
+        ):
+            raise RuntimeError("Curator V2 lifecycle counts were malformed")
+        lifecycle_counts[name] = count
+    goal_count = status.get("goal_count")
+    if (
+        set(lifecycle_counts) != expected_statuses
+        or type(goal_count) is not int
+        or goal_count != total
+        or sum(lifecycle_counts.values()) != goal_count
+    ):
+        raise RuntimeError("Curator V2 goal totals did not reconcile")
     health_status = health.get("status") if isinstance(health, dict) else None
     if not isinstance(health_status, str) or health_status not in {
         "healthy",
@@ -503,7 +532,9 @@ async def _probe_curator_ledger(
     return {
         "is_error": False,
         "text": status_text,
+        "health_text": health_text,
         "goal_list_total": total,
+        "goal_status_counts": lifecycle_counts,
         "health_status": health_status,
         "health_gate_codes": gate_codes,
     }
@@ -1026,6 +1057,13 @@ def cmd_mcp_test(args):
         _success("Curator V2 ledger reads returned with Hermes context")
         _info(str(probe_result.get("text", ""))[:4096])
         _info(f"Paginated goal-list total: {probe_result['goal_list_total']}")
+        statuses = ", ".join(
+            f"{name}={count}"
+            for name, count in sorted(probe_result["goal_status_counts"].items())
+        )
+        _info(f"Goal lifecycle counts: {statuses}")
+        _info("Project health snapshot (separate observation):")
+        _info(str(probe_result["health_text"])[:4096])
         gates = ", ".join(probe_result["health_gate_codes"]) or "none"
         _info(f"Project health: {probe_result['health_status']} (gates: {gates})")
     if tools:

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -515,10 +516,27 @@ class TestEmit:
         second._outbox.close()
 
     @pytest.mark.asyncio
-    async def test_codex_durable_delivery_uses_managed_mcp_hook_context(self, tmp_path):
-        """A persisted Codex event reaches Hermes' managed MCP session before ack."""
+    async def test_codex_runtime_turn_reaches_managed_mcp_before_ack(
+        self, tmp_path, monkeypatch
+    ):
+        """A Codex turn reaches the managed MCP hook before its outbox is acked."""
         from hermes_constants import get_hermes_home, profile_name_for_home
         from tools import mcp_tool
+        from agent.transports.codex_app_server_session import (
+            CodexAppServerSession,
+            TurnResult,
+        )
+        from gateway.run_turn_progress import GatewayTurnProgressMixin
+        from pm import environments
+
+        isolated_home = tmp_path / "hermes-home"
+        isolated_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(isolated_home))
+        monkeypatch.setattr(environments, "_payload_manifest", lambda _root: None)
+        # A source checkout can borrow the platform install's package store;
+        # keep that owner lookup inside this test's isolated home as well.
+        monkeypatch.setattr(environments, "owning_home_root", lambda _root: isolated_home)
+        import run_agent
 
         mcp_result = SimpleNamespace(
             content=[],
@@ -552,8 +570,8 @@ class TestEmit:
         hook_dir.mkdir()
         (hook_dir / "HOOK.yaml").write_text(
             "name: curator\n"
-            "events: ['codex:turn:start']\n"
-            "durable_events: ['codex:turn:start']\n"
+            "events: ['codex:turn:start', 'codex:turn:end']\n"
+            "durable_events: ['codex:turn:start', 'codex:turn:end']\n"
         )
         (hook_dir / "handler.py").write_text(
             "observed = []\n"
@@ -596,30 +614,115 @@ class TestEmit:
             "tools.mcp_tool_loop._run_on_mcp_loop", side_effect=run_on_mcp_loop
         ), patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             assert registry._outbox is not None
-            assert registry._outbox.bind_goal("project-1", "session-1", "goal-1")
-            event = registry.queue_durable_event(
-                "codex:turn:start",
-                {
-                    "attempt_id": "attempt-1",
-                    "session_id": "session-1",
-                    "model": "must-not-be-retained",
-                    "cwd": "/private/repository",
-                },
+            def fake_run_turn(self, user_input, **kwargs):
+                return TurnResult(
+                    final_text=f"response: {user_input}",
+                    projected_messages=[
+                        {"role": "assistant", "content": f"response: {user_input}"}
+                    ],
+                    turn_id="turn-runtime-1",
+                    thread_id="thread-runtime-1",
+                )
+
+            monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+            monkeypatch.setattr(
+                CodexAppServerSession,
+                "ensure_started",
+                lambda self: "thread-runtime-1",
             )
-            assert event is not None
-            assert "model" not in event["context"]
-            assert "cwd" not in event["context"]
-            delivered = await registry.emit_durable(event)
-            observed = registry._durable_handlers["codex:turn:start"][0].__globals__["observed"]
+            agent = run_agent.AIAgent(
+                api_key="stub",
+                base_url="https://stub.invalid",
+                provider="openai",
+                api_mode="codex_app_server",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert registry._outbox.bind_goal(
+                "project-1", agent.session_id, "goal-1"
+            )
+            prompt_canary = "private-codex-prompt-6f3c"
+            response_canary = f"response: {prompt_canary}"
+            gateway_context = SimpleNamespace(
+                _hooks_ref=registry,
+                _loop_for_step=asyncio.get_running_loop(),
+            )
+            progress = SimpleNamespace(_ctx=gateway_context)
+            agent.event_callback = lambda event_type, context: (
+                GatewayTurnProgressMixin._event_callback_sync(
+                    progress, event_type, context
+                )
+            )
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = await asyncio.to_thread(
+                    agent.run_conversation, prompt_canary
+                )
+            assert result["completed"] is True
+
+            calls = registry._durable_handlers["codex:turn:start"][0].__globals__[
+                "observed"
+            ]
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline and (
+                registry._outbox.pending() or session.call_tool.await_count != 2
+            ):
+                await asyncio.sleep(0.01)
+            assert registry._outbox.pending() == []
+            assert session.call_tool.await_count == 2
+            assert [payload.get("result", {}).get("status") for payload in calls] == [
+                "processed",
+                "processed",
+            ]
+
+            lifecycle_calls = [
+                call.kwargs["arguments"]
+                for call in session.call_tool.await_args_list
+            ]
+            event = lifecycle_calls[0]
+            assert [call["event_type"] for call in lifecycle_calls] == [
+                "codex:turn:start", "codex:turn:end"
+            ]
+            source_sequences = [call["source_sequence"] for call in lifecycle_calls]
+            assert source_sequences[1] == source_sequences[0] + 1
+            assert all(call["goal_id"] == "goal-1" for call in lifecycle_calls)
+            assert all(
+                call["context"]["session_id"] == agent.session_id
+                for call in lifecycle_calls
+            )
+            assert lifecycle_calls[0]["context"] == {
+                "attempt_id": lifecycle_calls[1]["context"]["attempt_id"],
+                "session_id": agent.session_id,
+            }
+            assert prompt_canary not in repr(lifecycle_calls)
+            assert response_canary not in repr(lifecycle_calls)
+            assert event["event_id"]
+            assert event["source_sequence"] == source_sequences[0]
+
+            outbox_path = registry._outbox.path
+            for persisted in (
+                outbox_path,
+                Path(f"{outbox_path}-wal"),
+                Path(f"{outbox_path}-shm"),
+            ):
+                if persisted.exists():
+                    data = persisted.read_bytes()
+                    assert prompt_canary.encode() not in data
+                    assert response_canary.encode() not in data
+
+            delivered = True
+            observed = registry._durable_handlers["codex:turn:start"][0].__globals__[
+                "observed"
+            ]
             assert observed and observed[0].get("ok") is True, observed
             assert delivered
-            assert registry._outbox.pending() == []
 
             retry_event = registry.queue_durable_event(
                 "codex:turn:start",
-                {"attempt_id": "attempt-2", "session_id": "session-1"},
+                {"attempt_id": "attempt-retry", "session_id": agent.session_id},
             )
             assert retry_event is not None
+            assert retry_event["source_sequence"] == source_sequences[1] + 1
             mcp_result.structuredContent = {"status": "queued"}
             assert not await registry.emit_durable(retry_event)
             assert registry._outbox.pending() == [retry_event]
@@ -628,7 +731,7 @@ class TestEmit:
             assert await registry.emit_durable(retry_event)
             assert registry._outbox.pending() == []
 
-        assert session.call_tool.await_count == 3
+        assert session.call_tool.await_count == 4
         first_call = session.call_tool.await_args_list[0]
         tool, call_kwargs = first_call.args[0], first_call.kwargs
         assert tool == "hermes_codex_event"
@@ -636,17 +739,24 @@ class TestEmit:
         assert arguments["project_id"] == "project-1"
         assert arguments["goal_id"] == "goal-1"
         assert arguments["event_id"] == event["event_id"]
-        assert arguments["source_sequence"] == event["source_sequence"] == 1
+        assert (
+            arguments["source_sequence"]
+            == event["source_sequence"]
+            == source_sequences[0]
+        )
         assert arguments["context"] == {
-            "attempt_id": "attempt-1",
-            "session_id": "session-1",
+            "attempt_id": lifecycle_calls[0]["context"]["attempt_id"],
+            "session_id": agent.session_id,
         }
         assert call_kwargs["meta"] == {
             "hermes/profile_id": profile_name_for_home(get_hermes_home()),
-            "hermes/session_id": "session-1",
+            "hermes/session_id": agent.session_id,
             "hermes/durable_event": True,
         }
-        retry_arguments = [call.kwargs["arguments"] for call in session.call_tool.await_args_list[1:]]
+        retry_arguments = [
+            call.kwargs["arguments"]
+            for call in session.call_tool.await_args_list[2:]
+        ]
         assert [call["event_id"] for call in retry_arguments] == [
             retry_event["event_id"],
             retry_event["event_id"],

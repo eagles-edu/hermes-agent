@@ -315,7 +315,13 @@ class TestMcpTest:
                 {
                     "is_error": False,
                     "text": '{"goal_count":1,"fact_count":2}',
+                    "health_text": '{"status":"unknown","gate_codes":[]}',
                     "goal_list_total": 1,
+                    "goal_status_counts": {
+                        "planned": 0, "active": 1, "complete": 0, "open": 0,
+                        "blocked": 0, "deferred": 0, "cancelled": 0,
+                        "superseded": 0,
+                    },
                     "health_status": "unknown",
                     "health_gate_codes": ["dependency_unknown:event_router"],
                 }
@@ -334,6 +340,9 @@ class TestMcpTest:
         assert "Curator V2 ledger reads returned with Hermes context" in output
         assert '{"goal_count":1,"fact_count":2}' in output
         assert "Paginated goal-list total: 1" in output
+        assert "Goal lifecycle counts: active=1, blocked=0" in output
+        assert "Project health snapshot (separate observation):" in output
+        assert '{"status":"unknown","gate_codes":[]}' in output
         assert "Project health: unknown (gates: dependency_unknown:event_router)" in output
         assert seen["curator_status_probe"] is True
         assert seen["probe_session_id"].startswith("curator-status-probe-")
@@ -762,7 +771,16 @@ class TestCuratorStatusProbe:
                 calls.append((name, arguments, meta))
                 responses = {
                     "project_activity_status": (
-                        '{"project_id":"vhost-manager-alpha","goal_count":1}'
+                        '{"project_id":"vhost-manager-alpha","goal_count":1,'
+                        '"goal_status_counts":['
+                        '{"status":"planned","count":0},'
+                        '{"status":"active","count":1},'
+                        '{"status":"complete","count":0},'
+                        '{"status":"open","count":0},'
+                        '{"status":"blocked","count":0},'
+                        '{"status":"deferred","count":0},'
+                        '{"status":"cancelled","count":0},'
+                        '{"status":"superseded","count":0}]}'
                     ),
                     "goal_list_page": (
                         '{"project_id":"vhost-manager-alpha","total":1,'
@@ -820,8 +838,33 @@ class TestCuratorStatusProbe:
         ]
         assert result == {
             "is_error": False,
-            "text": '{"project_id":"vhost-manager-alpha","goal_count":1}',
+            "text": (
+                '{"project_id":"vhost-manager-alpha","goal_count":1,'
+                '"goal_status_counts":['
+                '{"status":"planned","count":0},'
+                '{"status":"active","count":1},'
+                '{"status":"complete","count":0},'
+                '{"status":"open","count":0},'
+                '{"status":"blocked","count":0},'
+                '{"status":"deferred","count":0},'
+                '{"status":"cancelled","count":0},'
+                '{"status":"superseded","count":0}]}'
+            ),
+            "health_text": (
+                '{"project_id":"vhost-manager-alpha","status":"unknown",'
+                '"gate_codes":["dependency_unknown:event_router"]}'
+            ),
             "goal_list_total": 1,
+            "goal_status_counts": {
+                "planned": 0,
+                "active": 1,
+                "complete": 0,
+                "open": 0,
+                "blocked": 0,
+                "deferred": 0,
+                "cancelled": 0,
+                "superseded": 0,
+            },
             "health_status": "unknown",
             "health_gate_codes": ["dependency_unknown:event_router"],
         }

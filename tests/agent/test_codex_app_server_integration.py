@@ -12,6 +12,10 @@ Verifies that:
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +23,8 @@ import pytest
 
 import run_agent
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+from gateway.hooks import HookRegistry
+from gateway.run_turn_progress import GatewayTurnProgressMixin
 
 
 @pytest.fixture
@@ -217,6 +223,82 @@ class TestRunConversationCodexPath:
         }
         assert "private user prompt" not in repr(events)
         assert "echo: private user prompt" not in repr(events)
+
+    def test_codex_lifecycle_events_reach_profile_outbox_without_transcript(
+        self, tmp_path, fake_session
+    ):
+        """Join the Codex producer, gateway callback, and durable profile hook."""
+        profile_home = tmp_path / "profile-one"
+        hooks_dir = profile_home / "hooks"
+        hook_dir = hooks_dir / "curator"
+        hook_dir.mkdir(parents=True)
+        (hook_dir / "HOOK.yaml").write_text(
+            "name: curator\n"
+            "events: ['codex:turn:start', 'codex:turn:end']\n"
+            "durable_events: ['codex:turn:start', 'codex:turn:end']\n"
+        )
+        (hook_dir / "handler.py").write_text(
+            "calls = []\n"
+            "def handle(event_type, context):\n"
+            "    calls.append((event_type, dict(context)))\n"
+            "    return True\n"
+        )
+        registry = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", hooks_dir):
+            registry.discover_and_load()
+        assert registry._outbox is not None
+
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        context = SimpleNamespace(_hooks_ref=registry, _loop_for_step=loop)
+        progress = SimpleNamespace(_ctx=context)
+        agent = _make_codex_agent(
+            event_callback=lambda event_type, payload: (
+                GatewayTurnProgressMixin._event_callback_sync(
+                    progress, event_type, payload
+                )
+            )
+        )
+        assert registry._outbox.bind_goal("project-1", agent.session_id, "goal-1")
+        prompt_canary = "private-codex-prompt-6f3c"
+        response_canary = f"echo: {prompt_canary}"
+        try:
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = agent.run_conversation(prompt_canary)
+            assert result["completed"] is True
+
+            calls = registry._durable_handlers["codex:turn:start"][0].__globals__["calls"]
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and (
+                registry._outbox.pending() or len(calls) != 2
+            ):
+                time.sleep(0.01)
+
+            assert registry._outbox.pending() == []
+            assert [event_type for event_type, _ in calls] == [
+                "codex:turn:start", "codex:turn:end"
+            ]
+            assert [payload["source_sequence"] for _, payload in calls] == [1, 2]
+            assert calls[0][1]["attempt_id"] == calls[1][1]["attempt_id"]
+            assert calls[0][1]["session_id"] == calls[1][1]["session_id"]
+            assert calls[1][1]["outcome"] == "completed"
+            assert prompt_canary not in repr(calls)
+            assert response_canary not in repr(calls)
+
+            outbox_path = registry._outbox.path
+            registry._outbox.close()
+            for persisted in (outbox_path, Path(f"{outbox_path}-wal"), Path(f"{outbox_path}-shm")):
+                if persisted.exists():
+                    data = persisted.read_bytes()
+                    assert prompt_canary.encode() not in data
+                    assert response_canary.encode() not in data
+        finally:
+            if registry._outbox is not None:
+                registry._outbox.close()
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=2)
+            loop.close()
 
     def test_codex_lifecycle_failure_event_omits_exception_text(self, monkeypatch):
         def fail_run_turn(self, user_input: str, **kwargs):
