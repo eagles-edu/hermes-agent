@@ -113,6 +113,11 @@ def _read_usage(project_id: str) -> dict[str, Any]:
                 (project_id,),
             ).fetchall()
         ]
+        interval = connection.execute(
+            "SELECT MIN(occurred_at), MAX(occurred_at) "
+            "FROM project_usage_events WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
         models: dict[tuple[str, str], dict[str, Any]] = {}
         for row in model_rows[:_MAX_MODEL_ROWS]:
             provider, model, usage_status, turns, *sums = row
@@ -155,6 +160,11 @@ def _read_usage(project_id: str) -> dict[str, Any]:
             "turns": int(totals[0] or 0),
             "reported_turns": int(totals[1] or 0),
             "unknown_usage_turns": int(totals[2] or 0),
+            "measurement_scope": "all_retained_project_usage_rows",
+            "measurement_interval": {
+                "first_occurred_at": interval[0],
+                "last_occurred_at": interval[1],
+            },
             # ``tokens_complete`` describes captured rows, not the project-wide
             # coverage that remains partial while known call classes are excluded.
             "coverage_complete": False,

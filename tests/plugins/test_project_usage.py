@@ -88,6 +88,9 @@ def test_reads_only_configured_project_aggregates_without_private_ids(tmp_path, 
     assert report["status"] == "available"
     assert report["coverage"].startswith("bound Codex app-server")
     assert report["sources"] == ["codex_app_server"]
+    assert report["measurement_scope"] == "all_retained_project_usage_rows"
+    interval = report["measurement_interval"]
+    assert interval["first_occurred_at"] <= interval["last_occurred_at"]
     assert report["project_id"] == "gptmd"
     assert report["turns"] == 2
     assert report["reported_turns"] == 1
@@ -210,6 +213,10 @@ def test_empty_ledger_reports_zero_turns_without_inventing_token_totals(tmp_path
 
     assert report["status"] == "available"
     assert report["turns"] == 0
+    assert report["measurement_interval"] == {
+        "first_occurred_at": None,
+        "last_occurred_at": None,
+    }
     assert report["reported_turns"] == 0
     assert report["unknown_usage_turns"] == 0
     assert set(report["tokens"].values()) == {None}

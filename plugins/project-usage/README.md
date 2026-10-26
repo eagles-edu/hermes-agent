@@ -37,4 +37,6 @@ normalization: `input` is uncached input where Hermes has that distinction,
 while `cache_read` and `cache_write` are separate buckets. `total` is the
 source-reported or normalized total and may already include cache buckets; do
 not add it to the sub-buckets. Results contain no goal, session, turn, or event
-identifiers, and the SQLite ledger is opened read-only.
+identifiers, and the SQLite ledger is opened read-only. Each report includes
+the first and last event times currently retained for that project; this is the
+captured ledger span, not a billing period or a promise of complete coverage.
