@@ -38,5 +38,8 @@ while `cache_read` and `cache_write` are separate buckets. `total` is the
 source-reported or normalized total and may already include cache buckets; do
 not add it to the sub-buckets. Results contain no goal, session, turn, or event
 identifiers, and the SQLite ledger is opened read-only. Each report includes
-the first and last event times currently retained for that project; this is the
-captured ledger span, not a billing period or a promise of complete coverage.
+the first and last event times currently retained for that project, the UTC
+measurement time, and the latest event's age in seconds. The age is `null` when
+no valid event timestamp is available. It is a measured value without a
+freshness threshold; it does not classify the ledger as fresh or stale, and it
+is not a billing period or a promise of complete coverage.

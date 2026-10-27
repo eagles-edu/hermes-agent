@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,8 @@ PROJECT_USAGE = {
         "attempts without a returned response, and unbound sessions are excluded. "
         "The response marks this coverage partial even if every captured turn has reported tokens. "
         "Token totals may already include cache buckets; do not add totals to input/cache values. "
-        "It does not expose session or goal identifiers."
+        "The report includes the read time and age of its latest retained event without a "
+        "freshness threshold. It does not expose session or goal identifiers."
     ),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
@@ -118,6 +120,18 @@ def _read_usage(project_id: str) -> dict[str, Any]:
             "FROM project_usage_events WHERE project_id = ?",
             (project_id,),
         ).fetchone()
+        measured_at = datetime.now(UTC)
+        latest_event_age_seconds: int | None = None
+        if isinstance(interval[1], str):
+            try:
+                latest_event = datetime.fromisoformat(interval[1])
+                if latest_event.tzinfo is not None:
+                    age = measured_at - latest_event.astimezone(UTC)
+                    if age >= timedelta(0):
+                        latest_event_age_seconds = int(age.total_seconds())
+            except ValueError:
+                # Keep the age unknown when the stored observation time is invalid.
+                pass
         models: dict[tuple[str, str], dict[str, Any]] = {}
         for row in model_rows[:_MAX_MODEL_ROWS]:
             provider, model, usage_status, turns, *sums = row
@@ -165,6 +179,8 @@ def _read_usage(project_id: str) -> dict[str, Any]:
                 "first_occurred_at": interval[0],
                 "last_occurred_at": interval[1],
             },
+            "measured_at": measured_at.isoformat(timespec="microseconds"),
+            "latest_event_age_seconds": latest_event_age_seconds,
             # ``tokens_complete`` describes captured rows, not the project-wide
             # coverage that remains partial while known call classes are excluded.
             "coverage_complete": False,

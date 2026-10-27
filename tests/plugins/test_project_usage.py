@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import hermes_yaml as yaml
 
@@ -91,6 +92,11 @@ def test_reads_only_configured_project_aggregates_without_private_ids(tmp_path, 
     assert report["measurement_scope"] == "all_retained_project_usage_rows"
     interval = report["measurement_interval"]
     assert interval["first_occurred_at"] <= interval["last_occurred_at"]
+    measured_at = datetime.fromisoformat(report["measured_at"])
+    assert measured_at.tzinfo is not None
+    assert measured_at.utcoffset() == timedelta(0)
+    assert isinstance(report["latest_event_age_seconds"], int)
+    assert report["latest_event_age_seconds"] >= 0
     assert report["project_id"] == "gptmd"
     assert report["turns"] == 2
     assert report["reported_turns"] == 1
@@ -217,6 +223,8 @@ def test_empty_ledger_reports_zero_turns_without_inventing_token_totals(tmp_path
         "first_occurred_at": None,
         "last_occurred_at": None,
     }
+    assert datetime.fromisoformat(report["measured_at"]).tzinfo == UTC
+    assert report["latest_event_age_seconds"] is None
     assert report["reported_turns"] == 0
     assert report["unknown_usage_turns"] == 0
     assert set(report["tokens"].values()) == {None}
@@ -228,6 +236,33 @@ def test_empty_ledger_reports_zero_turns_without_inventing_token_totals(tmp_path
     assert report["tokens_complete"] is True
     assert report["by_provider_model"] == []
     outbox._connection.close()
+
+
+def test_future_event_timestamp_keeps_latest_event_age_unknown(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _configure(home)
+
+    from gateway.codex_outbox import CodexLifecycleOutbox
+
+    outbox = CodexLifecycleOutbox(profile_id="gptmd-coding")
+    _record_turn(outbox, "gptmd", "session-private", "attempt-future", usage={
+        "input_tokens": 100,
+        "output_tokens": 25,
+        "total_tokens": 125,
+    })
+    outbox._connection.execute(
+        "UPDATE project_usage_events SET occurred_at = ? WHERE project_id = ?",
+        ("2999-01-01T00:00:00+00:00", "gptmd"),
+    )
+    outbox._connection.commit()
+
+    report = json.loads(_tool().handler({}))
+
+    assert report["measurement_interval"]["last_occurred_at"] == "2999-01-01T00:00:00+00:00"
+    assert report["latest_event_age_seconds"] is None
+    outbox.close()
 
 
 def test_unconfigured_or_invalid_project_id_cannot_select_a_project(tmp_path, monkeypatch):
