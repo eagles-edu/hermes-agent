@@ -6,6 +6,7 @@ any actual MCP servers or API keys.
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -54,6 +55,7 @@ def _make_args(**kwargs):
         "preset": None,
         "env": None,
         "mcp_action": None,
+        "json_output": False,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -324,6 +326,11 @@ class TestMcpTest:
                     },
                     "health_status": "unknown",
                     "health_gate_codes": ["dependency_unknown:event_router"],
+                    "health_snapshot": {
+                        "project_id": "pilot-project",
+                        "status": "unknown",
+                        "gate_codes": ["dependency_unknown:event_router"],
+                    },
                 }
             )
             return [
@@ -346,6 +353,81 @@ class TestMcpTest:
         assert "Project health: unknown (gates: dependency_unknown:event_router)" in output
         assert seen["curator_status_probe"] is True
         assert seen["probe_session_id"].startswith("curator-status-probe-")
+
+
+    def test_curator_status_probe_json_is_one_project_bound_health_record(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        _seed_config(tmp_path, {
+            "curator_v2": {
+                "command": "/usr/local/bin/curatormd-v2-mcp",
+                "hermes_context": True,
+                "hermes_project_id": "pilot-project",
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        def probe(name, config, **kwargs):
+            kwargs["probe_result"].update({
+                "is_error": False,
+                "health_snapshot": {
+                    "project_id": "pilot-project",
+                    "status": "healthy",
+                    "gate_codes": [],
+                    "dependencies": [{"name": "event_router", "status": "healthy"}],
+                },
+            })
+            return [("project_health", "Bounded readiness summary")]
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", probe)
+        args = _make_args(
+            name="curator_v2", probe_curator_status=True, json_output=True
+        )
+
+        assert cmd_mcp_test(args) == 0
+        output = capsys.readouterr().out
+        payload = json.loads(output)
+        assert payload == {
+            "schema_version": 1,
+            "connected": True,
+            "project_id": "pilot-project",
+            "health": {
+                "project_id": "pilot-project",
+                "status": "healthy",
+                "gate_codes": [],
+                "dependencies": [{"name": "event_router", "status": "healthy"}],
+            },
+        }
+
+
+    def test_json_mcp_probe_failure_exposes_only_a_fixed_failure_code(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        _seed_config(tmp_path, {
+            "curator_v2": {
+                "command": "/missing/curatormd-v2-mcp",
+                "hermes_context": True,
+                "hermes_project_id": "pilot-project",
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        def fail(*args, **kwargs):
+            raise FileNotFoundError("/private/token/path")
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", fail)
+        args = _make_args(
+            name="curator_v2", probe_curator_status=True, json_output=True
+        )
+
+        assert cmd_mcp_test(args) == 1
+        output = capsys.readouterr().out
+        assert json.loads(output) == {
+            "schema_version": 1,
+            "connected": False,
+            "code": "server_start_failed",
+        }
+        assert "/private/token/path" not in output
 
 
     def test_local_hermes_context_is_not_reported_as_auth_none(self, tmp_path, capsys, monkeypatch):
@@ -867,6 +949,11 @@ class TestCuratorStatusProbe:
             },
             "health_status": "unknown",
             "health_gate_codes": ["dependency_unknown:event_router"],
+        "health_snapshot": {
+            "project_id": "vhost-manager-alpha",
+            "status": "unknown",
+            "gate_codes": ["dependency_unknown:event_router"],
+        },
         }
         assert "private" not in repr(result)
         with pytest.raises(RuntimeError, match="configured Hermes project"):

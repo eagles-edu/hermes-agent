@@ -56,6 +56,12 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
             "profile/session context (curator_v2 local stdio only)"
         ),
     )
+    mcp_test_p.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit a bounded machine-readable result (requires --probe-curator-status)",
+    )
 
     mcp_cfg_p = mcp_sub.add_parser("configure", aliases=["config"], help="Toggle tool selection")
     mcp_cfg_p.add_argument("name", help="Server name to configure")

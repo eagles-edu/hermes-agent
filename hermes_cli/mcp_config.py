@@ -533,6 +533,7 @@ async def _probe_curator_ledger(
         "is_error": False,
         "text": status_text,
         "health_text": health_text,
+        "health_snapshot": health,
         "goal_list_total": total,
         "goal_status_counts": lifecycle_counts,
         "health_status": health_status,
@@ -989,10 +990,21 @@ def cmd_mcp_test(args):
     already owns 2 for usage errors, so "no such server" stays distinguishable from "bad flags").
     """
     name = args.name
+    json_output = bool(getattr(args, "json_output", False))
+    curator_status_probe = bool(getattr(args, "probe_curator_status", False))
+
+    def emit_json(result: dict[str, Any]) -> None:
+        print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+
+    if json_output and not curator_status_probe:
+        emit_json({"schema_version": 1, "connected": False, "code": "probe_required"})
+        return 1
     cfg = _lookup_server(name, _get_mcp_servers(), "Available")
     if cfg is None:
+        if json_output:
+            emit_json({"schema_version": 1, "connected": False, "code": "server_not_configured"})
         return 3
-    probe_curator_status = bool(getattr(args, "probe_curator_status", False))
+    probe_curator_status = curator_status_probe
     if probe_curator_status and (
         name != "curator_v2"
         or cfg.get("hermes_context") is not True
@@ -1000,33 +1012,38 @@ def cmd_mcp_test(args):
         or not cfg.get("command", "").strip()
         or cfg.get("url")
     ):
+        if json_output:
+            emit_json({"schema_version": 1, "connected": False, "code": "probe_not_configured"})
+            return 1
         _error("Curator status probe requires the opted-in local stdio curator_v2 server")
         return 1
-    print()
-    print(color(f"  Testing '{name}'...", Colors.CYAN))
-    if "url" in cfg:
-        _info(f"Transport: HTTP → {cfg['url']}")
-    else:
-        _info(f"Transport: stdio → {cfg.get('command', '?')}")
+    if not json_output:
+        print()
+        print(color(f"  Testing '{name}'...", Colors.CYAN))
+        if "url" in cfg:
+            _info(f"Transport: HTTP → {cfg['url']}")
+        else:
+            _info(f"Transport: stdio → {cfg.get('command', '?')}")
 
     headers = cfg.get("headers", {})
-    if cfg.get("auth", "") == "oauth":
-        _info("Auth: OAuth 2.0")
-    elif (
-        cfg.get("hermes_context") is True
-        and isinstance(cfg.get("command"), str)
-        and bool(cfg["command"].strip())
-        and not cfg.get("url")
-    ):
-        _info("Context: Hermes profile/session (host-injected; local stdio)")
-    elif headers:
-        for k, v in headers.items():
-            if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
-                # Keep header identity with the value. A ${ENV} substring is
-                # not proof the rest of the header is non-secret.
-                print(f"    {k}: {redact_mcp_header_display(k, v)}")
-    else:
-        _info("Auth: none")
+    if not json_output:
+        if cfg.get("auth", "") == "oauth":
+            _info("Auth: OAuth 2.0")
+        elif (
+            cfg.get("hermes_context") is True
+            and isinstance(cfg.get("command"), str)
+            and bool(cfg["command"].strip())
+            and not cfg.get("url")
+        ):
+            _info("Context: Hermes profile/session (host-injected; local stdio)")
+        elif headers:
+            for k, v in headers.items():
+                if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
+                    # Keep header identity with the value. A ${ENV} substring is
+                    # not proof the rest of the header is non-secret.
+                    print(f"    {k}: {redact_mcp_header_display(k, v)}")
+        else:
+            _info("Auth: none")
 
     start = time.monotonic()
     probe_result: dict[str, Any] = {}
@@ -1044,9 +1061,44 @@ def cmd_mcp_test(args):
         )
     except Exception as exc:
         elapsed = time.monotonic() - start
+        if json_output:
+            emit_json({
+                "schema_version": 1,
+                "connected": False,
+                "code": probe_failure_class(exc),
+            })
+            return 1
         _error(f"Connection failed ({elapsed:.1f}s): {_probe_failure_reason(exc)}")
         _info(_probe_failure_next_step(name, exc))
         return 1
+    if json_output:
+        if probe_result.get("is_error"):
+            emit_json({
+                "schema_version": 1,
+                "connected": True,
+                "code": "curator_read_rejected",
+            })
+            return 1
+        health_snapshot = probe_result.get("health_snapshot")
+        project_id = cfg.get("hermes_project_id")
+        if (
+            not isinstance(health_snapshot, dict)
+            or health_snapshot.get("project_id") != project_id
+            or health_snapshot.get("status") not in {"healthy", "degraded", "unknown"}
+        ):
+            emit_json({
+                "schema_version": 1,
+                "connected": True,
+                "code": "invalid_health_response",
+            })
+            return 1
+        emit_json({
+            "schema_version": 1,
+            "connected": True,
+            "project_id": project_id,
+            "health": health_snapshot,
+        })
+        return 0
     _success(f"Connected ({(time.monotonic() - start) * 1000:.0f}ms)")
     _success(f"Tools discovered: {len(tools)}")
     if probe_curator_status:

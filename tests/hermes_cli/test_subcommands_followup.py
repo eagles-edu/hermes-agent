@@ -37,3 +37,7 @@ def test_mcp_and_acp_accept_hooks_flag():
     assert ns.accept_hooks is True
     mcp_ns = parser.parse_args(["mcp", "test", "curator_v2", "--probe-curator-status"])
     assert mcp_ns.probe_curator_status is True
+    json_ns = parser.parse_args([
+        "mcp", "test", "curator_v2", "--probe-curator-status", "--json"
+    ])
+    assert json_ns.json_output is True
