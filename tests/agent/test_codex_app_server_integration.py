@@ -13,6 +13,7 @@ Verifies that:
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 import threading
 import time
@@ -223,6 +224,53 @@ class TestRunConversationCodexPath:
         }
         assert "private user prompt" not in repr(events)
         assert "echo: private user prompt" not in repr(events)
+
+    def test_codex_work_summary_flows_from_completed_items_to_turn_event(
+        self, monkeypatch, tmp_path
+    ):
+        def fake_run_turn(session, user_input: str, **kwargs):
+            session._on_event({"method": "item/completed", "params": {"item": {
+                "type": "fileChange",
+                "status": "completed",
+                "changes": [{"path": str(tmp_path / "src" / "change.py"),
+                             "kind": {"type": "update"}}],
+            }}})
+            session._on_event({"method": "item/completed", "params": {"item": {
+                "type": "commandExecution",
+                "command": "uv run --locked scripts/check",
+                "exitCode": 0,
+                "aggregatedOutput": "private test output canary",
+            }}})
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-summary-1",
+                thread_id="thread-summary-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-summary-1"
+        )
+        events = []
+        agent = _make_codex_agent(
+            event_callback=lambda name, context: events.append((name, context))
+        )
+        agent.session_cwd = str(tmp_path)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("private user prompt canary")
+
+        assert result["completed"] is True
+        assert [name for name, _ in events] == ["codex:turn:start", "codex:turn:end"]
+        end_context = events[-1][1]
+        summary = json.loads(end_context["work_summary_json"])
+        assert summary["changed_files"] == [
+            {"path": "src/change.py", "change": "update"}
+        ]
+        assert summary["checks"] == [{"name": "scripts/check", "exit_code": 0}]
+        assert "private test output canary" not in repr(events)
+        assert "private user prompt canary" not in repr(events)
 
     def test_codex_lifecycle_events_reach_profile_outbox_without_transcript(
         self, tmp_path, fake_session

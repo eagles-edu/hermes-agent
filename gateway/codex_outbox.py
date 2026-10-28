@@ -25,13 +25,19 @@ from hermes_constants import get_hermes_home
 _EVENT_FIELDS = {
     "codex:turn:start": frozenset({"attempt_id", "session_id"}),
     "codex:turn:end": frozenset(
-        {"attempt_id", "session_id", "turn_id", "outcome", "failure_kind"}
+        {
+            "attempt_id", "session_id", "turn_id", "outcome", "failure_kind",
+            "work_summary_json",
+        }
     ),
 }
 _ACCEPTED_FIELDS = {
     "codex:turn:start": frozenset({"attempt_id", "session_id", "model", "provider", "cwd"}),
     "codex:turn:end": frozenset(
-        {"attempt_id", "session_id", "model", "provider", "cwd", "turn_id", "outcome", "failure_kind", "usage"}
+        {
+            "attempt_id", "session_id", "model", "provider", "cwd", "turn_id",
+            "outcome", "failure_kind", "usage", "work_summary_json",
+        }
     ),
 }
 _USAGE_FIELDS = frozenset({
@@ -43,6 +49,61 @@ _OUTCOME_VALUES = frozenset({"completed", "interrupted", "failed"})
 _FAILURE_KIND_VALUES = frozenset({"exception", "postprocess_exception", "codex_error"})
 _PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$")
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$")
+_WORK_SUMMARY_PATH_RE = re.compile(r"^[A-Za-z0-9_./ @+-]{1,256}$")
+_WORK_SUMMARY_CHECKS = frozenset(
+    {"scripts/check", "scripts/run_tests.sh", "git diff --check", "pytest", "npm test"}
+)
+
+
+def _valid_work_summary(value: object) -> bool:
+    """Accept only the tiny, content-free summary produced by the Codex runtime."""
+
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 4096:
+        return False
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(decoded, dict) or set(decoded) != {
+        "schema_version", "repository_fingerprint", "changed_files",
+        "omitted_files", "checks", "omitted_checks",
+    } or decoded.get("schema_version") != 1:
+        return False
+    fingerprint = decoded.get("repository_fingerprint")
+    files, checks = decoded.get("changed_files"), decoded.get("checks")
+    omitted_files, omitted_checks = decoded.get("omitted_files"), decoded.get("omitted_checks")
+    if (
+        not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+        or not isinstance(files, list) or len(files) > 16
+        or not isinstance(checks, list) or len(checks) > 8
+        or type(omitted_files) is not int or not 0 <= omitted_files <= 1_000_000
+        or type(omitted_checks) is not int or not 0 <= omitted_checks <= 1_000_000
+    ):
+        return False
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"path", "change"}:
+            return False
+        path, change = item.get("path"), item.get("change")
+        if (
+            not isinstance(path, str) or not _WORK_SUMMARY_PATH_RE.fullmatch(path)
+            or path.startswith("/") or ".." in path.split("/")
+            or any(
+                part.lower().startswith((".env", "secret", "credential"))
+                for part in path.split("/")
+            )
+            or change not in {"add", "update", "delete", "rename"}
+        ):
+            return False
+    for item in checks:
+        if not isinstance(item, dict) or set(item) != {"name", "exit_code"}:
+            return False
+        if (
+            item.get("name") not in _WORK_SUMMARY_CHECKS
+            or type(item.get("exit_code")) is not int
+            or not 0 <= item["exit_code"] <= 255
+        ):
+            return False
+    return True
 
 
 def _source_id(profile_id: str, project_id: str, source_epoch: int) -> str:
@@ -304,6 +365,10 @@ class CodexLifecycleOutbox:
                     for key in sorted(allowed)
                     if key in context
                     and (
+                        key != "work_summary_json"
+                        or _valid_work_summary(context[key])
+                    )
+                    and (
                         key != "failure_kind"
                         or (
                             isinstance(context[key], str)
@@ -313,10 +378,10 @@ class CodexLifecycleOutbox:
                 }
                 if any(
                     not isinstance(value, str)
-                    or len(value) > 256
+                    or len(value) > (4096 if key == "work_summary_json" else 256)
                     or "\n" in value
                     or "\r" in value
-                    for value in retained_context.values()
+                    for key, value in retained_context.items()
                 ):
                     self._connection.rollback()
                     return None

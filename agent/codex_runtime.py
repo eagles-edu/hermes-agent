@@ -71,6 +71,7 @@ def _emit_codex_lifecycle_event(
     turn_id: str | None = None,
     failure_kind: str | None = None,
     usage: dict[str, Any] | None = None,
+    work_summary_json: str | None = None,
 ) -> None:
     """Emit bounded Codex runtime metadata to the active Gateway hook registry.
 
@@ -109,6 +110,12 @@ def _emit_codex_lifecycle_event(
         }
         if safe_usage:
             context["usage"] = safe_usage
+    if (
+        event_type == "codex:turn:end"
+        and isinstance(work_summary_json, str)
+        and 1 <= len(work_summary_json.encode("utf-8")) <= 4096
+    ):
+        context["work_summary_json"] = work_summary_json
     _call_guarded(
         callback,
         "Codex lifecycle event callback raised for %s",
@@ -497,6 +504,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(item, dict):
             return
         item_type = item.get("type") or ""
+        if completed:
+            summary = getattr(agent, "_curator_codex_work_summary", None)
+            if summary is not None:
+                summary.observe(item)
         if item_type in _CODEX_TOOL_ITEM_TYPES:
             (_fire_tool_completed if completed else _fire_tool_started)(item)
         elif completed and item_type == "agentMessage":
@@ -792,6 +803,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent, messages)
+    from agent.codex_work_summary import CodexWorkSummary
+
+    agent._curator_codex_work_summary = CodexWorkSummary(
+        getattr(agent, "session_cwd", None)
+    )
     attempt_id = uuid.uuid4().hex
     _emit_codex_lifecycle_event(agent, "codex:turn:start", attempt_id=attempt_id)
     try:
@@ -810,6 +826,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
             attempt_id=attempt_id,
             outcome="failed",
             failure_kind="exception",
+            work_summary_json=_take_codex_work_summary(agent),
         )
         return _turn_result(
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
@@ -838,6 +855,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
             turn_id=turn.turn_id,
             outcome="failed",
             failure_kind="postprocess_exception",
+            work_summary_json=_take_codex_work_summary(agent),
         )
         raise
     outcome = (
@@ -855,6 +873,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         outcome=outcome,
         failure_kind="codex_error" if turn.error is not None else None,
         usage=usage_result,
+        work_summary_json=_take_codex_work_summary(agent),
     )
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
@@ -862,6 +881,14 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
         **usage_result,
     )
+
+
+def _take_codex_work_summary(agent: Any) -> str | None:
+    """Serialize and release this turn's bounded work summary."""
+
+    summary = getattr(agent, "_curator_codex_work_summary", None)
+    agent._curator_codex_work_summary = None
+    return summary.to_json() if summary is not None else None
 
 
 def _turn_result(interrupt: tuple[bool, Any], messages: list[dict[str, Any]], *, api_calls: int, completed: bool,
