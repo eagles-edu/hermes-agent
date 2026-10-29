@@ -58,3 +58,25 @@ def test_outbox_drops_malformed_or_oversized_work_summary_but_keeps_lifecycle(tm
         assert "private prompt" not in json.dumps(event)
     finally:
         outbox.close()
+
+
+def test_outbox_rejects_private_paths_even_with_valid_summary_schema(tmp_path):
+    outbox = CodexLifecycleOutbox(tmp_path / "outbox.sqlite3", profile_id="profile-a")
+    try:
+        assert outbox.bind_goal("project-a", "session-a", "goal-a")
+        forged = json.loads(_summary("a" * 64))
+        forged["changed_files"] = [{"path": ".aws/credentials", "change": "update"}]
+        event = outbox.enqueue("codex:turn:end", {
+            "attempt_id": "attempt-a",
+            "session_id": "session-a",
+            "turn_id": "turn-a",
+            "outcome": "completed",
+            "work_summary_json": json.dumps(forged),
+        })
+
+        assert event is not None
+        assert "work_summary_json" not in event["context"]
+        assert ".aws" not in json.dumps(event)
+        assert "credentials" not in json.dumps(event)
+    finally:
+        outbox.close()

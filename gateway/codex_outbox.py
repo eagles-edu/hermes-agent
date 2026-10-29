@@ -53,6 +53,28 @@ _WORK_SUMMARY_PATH_RE = re.compile(r"^[A-Za-z0-9_./ @+-]{1,256}$")
 _WORK_SUMMARY_CHECKS = frozenset(
     {"scripts/check", "scripts/run_tests.sh", "git diff --check", "pytest", "npm test"}
 )
+_WORK_SUMMARY_PRIVATE_NAMES = frozenset({
+    ".env", ".npmrc", ".pypirc", ".netrc", "credentials", "secrets",
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "authorized_keys",
+    "known_hosts", "application_default_credentials.json",
+})
+_WORK_SUMMARY_PRIVATE_DIRECTORIES = frozenset(
+    {".aws", ".azure", ".docker", ".gnupg", ".kube", ".ssh"}
+)
+_WORK_SUMMARY_PRIVATE_SUFFIXES = (".key", ".pem", ".p12", ".pfx", ".jks", ".keystore")
+
+
+def _private_work_summary_path(path: str) -> bool:
+    """Reject path labels that commonly identify credentials, keys, or certs."""
+
+    parts = tuple(part.lower() for part in path.split("/"))
+    basename = parts[-1] if parts else ""
+    return (
+        basename in _WORK_SUMMARY_PRIVATE_NAMES
+        or basename.endswith(_WORK_SUMMARY_PRIVATE_SUFFIXES)
+        or any(part in _WORK_SUMMARY_PRIVATE_DIRECTORIES for part in parts)
+        or any(part.startswith((".env", "secret", "credential")) for part in parts)
+    )
 
 
 def _valid_work_summary(value: object) -> bool:
@@ -87,10 +109,7 @@ def _valid_work_summary(value: object) -> bool:
         if (
             not isinstance(path, str) or not _WORK_SUMMARY_PATH_RE.fullmatch(path)
             or path.startswith("/") or ".." in path.split("/")
-            or any(
-                part.lower().startswith((".env", "secret", "credential"))
-                for part in path.split("/")
-            )
+            or _private_work_summary_path(path)
             or change not in {"add", "update", "delete", "rename"}
         ):
             return False
