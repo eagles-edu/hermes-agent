@@ -15,7 +15,14 @@ _MAX_FILES = 16
 _MAX_CHECKS = 8
 _MAX_JSON_BYTES = 4096
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9_./ @+-]{1,128}$")
-_PRIVATE_BASENAMES = {".env", ".env.local", "credentials", "secrets"}
+_PRIVATE_BASENAMES = {
+    ".env", ".env.local", ".npmrc", ".pypirc", ".netrc", "credentials",
+    "secrets", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+    "authorized_keys", "known_hosts", "application_default_credentials.json",
+}
+_PRIVATE_DIRECTORIES = {".aws", ".azure", ".docker", ".gnupg", ".kube", ".ssh"}
+_PRIVATE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".jks", ".keystore"}
+_MAX_RAW_PATH_CHARS = 4096
 _MAX_OBSERVED_CHANGES = 256
 _MAX_OMITTED = 1_000_000
 
@@ -140,7 +147,12 @@ class CodexWorkSummary:
                 self._omitted_files = min(_MAX_OMITTED, self._omitted_files + 1)
 
     def _relative_path(self, raw_path: object) -> str | None:
-        if self._root is None or not isinstance(raw_path, str) or not raw_path:
+        if (
+            self._root is None
+            or not isinstance(raw_path, str)
+            or not raw_path
+            or len(raw_path) > _MAX_RAW_PATH_CHARS
+        ):
             return None
         if "\\" in raw_path or "\n" in raw_path or "\r" in raw_path:
             return None
@@ -156,12 +168,15 @@ class CodexWorkSummary:
             relative = candidate.relative_to(self._root).as_posix()
         except (OSError, ValueError):
             return None
+        parts = tuple(part.lower() for part in Path(relative).parts)
+        basename = parts[-1] if parts else ""
         if (
             relative in {"", "."}
             or not _SAFE_PATH.fullmatch(relative)
-            or Path(relative).name.lower() in _PRIVATE_BASENAMES
-            or any(part.lower().startswith((".env", "secret", "credential"))
-                   for part in Path(relative).parts)
+            or basename in _PRIVATE_BASENAMES
+            or basename.endswith(tuple(_PRIVATE_SUFFIXES))
+            or any(part in _PRIVATE_DIRECTORIES for part in parts)
+            or any(part.startswith((".env", "secret", "credential")) for part in parts)
         ):
             return None
         return relative

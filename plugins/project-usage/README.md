@@ -24,11 +24,14 @@ scope. If the local ledger or its expected schema is absent, the tool reports
 unavailable instead of creating a database or claiming zero usage.
 
 Coverage includes auxiliary provider responses whose usage can be normalized
-inside an active agent turn. Auxiliary calls outside that callback context,
-attempts without a returned response, and unbound sessions are excluded.
-Missing or unassignable token usage in a returned response is reported as
-unknown, not zero. The report sets `coverage_complete` to `false` and lists
-these known exclusions. Separately,
+inside an active agent turn. A durably recorded Codex app-server start without
+a matching end is counted as an unknown-usage turn, so an interrupted Hermes
+process does not make the attempt disappear. Auxiliary calls outside that
+callback context, auxiliary attempts without a returned response, attempts
+without a durable start event, and unbound sessions are excluded. Missing or
+unassignable token usage in a returned response is reported as unknown, not
+zero. The report sets `coverage_complete` to `false` and lists these known
+exclusions. Separately,
 `tokens_complete` indicates whether any turn in the captured ledger has unknown
 usage; it does not claim project-wide completeness. The report lists the sources
 it observed and aggregate totals by provider/model. It does not enforce budgets

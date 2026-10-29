@@ -89,7 +89,9 @@ def test_reads_only_configured_project_aggregates_without_private_ids(tmp_path, 
     assert report["status"] == "available"
     assert report["coverage"].startswith("bound Codex app-server")
     assert report["sources"] == ["codex_app_server"]
-    assert report["measurement_scope"] == "all_retained_project_usage_rows"
+    assert report["measurement_scope"] == (
+        "all_retained_project_usage_rows_and_durable_unclosed_codex_starts"
+    )
     interval = report["measurement_interval"]
     assert interval["first_occurred_at"] <= interval["last_occurred_at"]
     measured_at = datetime.fromisoformat(report["measured_at"])
@@ -104,7 +106,8 @@ def test_reads_only_configured_project_aggregates_without_private_ids(tmp_path, 
     assert report["coverage_complete"] is False
     assert report["coverage_exclusions"] == [
         "auxiliary_calls_outside_active_turn_context",
-        "auxiliary_attempts_without_response", "unbound_sessions",
+        "auxiliary_attempts_without_response",
+        "codex_attempts_without_durable_start_event", "unbound_sessions",
     ]
     assert report["tokens_complete"] is False
     assert report["tokens"] == {
@@ -135,6 +138,83 @@ def test_reads_only_configured_project_aggregates_without_private_ids(tmp_path, 
         assert private_value not in serialized
     assert before == after
     outbox._connection.close()
+
+
+def test_durable_codex_start_without_end_is_unknown_until_end_arrives(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _configure(home, "vhost")
+
+    from gateway.codex_outbox import CodexLifecycleOutbox
+
+    outbox = CodexLifecycleOutbox(profile_id="vhost-coding")
+    assert outbox.bind_goal("vhost", "session-private", "goal-private")
+    start = outbox.enqueue("codex:turn:start", {
+        "attempt_id": "attempt-private",
+        "session_id": "session-private",
+        "provider": "openai-codex",
+        "model": "gpt-5.6",
+    })
+    assert start is not None
+    # The durable event envelope retains correlation data only. Provider/model
+    # details are not persisted for interrupted starts, so their bucket stays unknown.
+    assert set(start["context"]) == {"attempt_id", "session_id"}
+    db_path = home / "curatormd" / "codex-outbox.sqlite3"
+    before = _ledger_snapshot(db_path)
+
+    interrupted = json.loads(_tool().handler({}))
+
+    assert interrupted["turns"] == 1
+    assert interrupted["reported_turns"] == 0
+    assert interrupted["unknown_usage_turns"] == 1
+    assert interrupted["tokens_complete"] is False
+    assert interrupted["measurement_scope"] == (
+        "all_retained_project_usage_rows_and_durable_unclosed_codex_starts"
+    )
+    assert interrupted["sources"] == ["codex_app_server"]
+    assert interrupted["by_provider_model"] == [{
+        "provider": "unknown",
+        "model": "unknown",
+        "turns": 1,
+        "reported_turns": 0,
+        "unknown_usage_turns": 1,
+        "tokens": {
+            "input": None, "output": None, "total": None,
+            "cache_read": None, "cache_write": None, "reasoning": None,
+        },
+    }]
+    serialized = json.dumps(interrupted)
+    assert "attempt-private" not in serialized
+    assert "session-private" not in serialized
+    assert "goal-private" not in serialized
+    assert _ledger_snapshot(db_path) == before
+
+    outbox.enqueue("codex:turn:end", {
+        "attempt_id": "attempt-private",
+        "session_id": "session-private",
+        "turn_id": "turn-private",
+        "outcome": "completed",
+        "provider": "openai-codex",
+        "model": "gpt-5.6",
+        "usage": {
+            "input_tokens": 20,
+            "output_tokens": 5,
+            "total_tokens": 25,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 2,
+        },
+    })
+    completed = json.loads(_tool().handler({}))
+
+    assert completed["turns"] == 1
+    assert completed["reported_turns"] == 1
+    assert completed["unknown_usage_turns"] == 0
+    assert completed["tokens_complete"] is True
+    assert completed["tokens"]["total"] == 25
+    assert "attempt-private" not in json.dumps(completed)
+    outbox.close()
 
 
 def test_includes_provider_api_turns_without_overcounting_multiple_models(tmp_path, monkeypatch):
@@ -231,7 +311,8 @@ def test_empty_ledger_reports_zero_turns_without_inventing_token_totals(tmp_path
     assert report["coverage_complete"] is False
     assert report["coverage_exclusions"] == [
         "auxiliary_calls_outside_active_turn_context",
-        "auxiliary_attempts_without_response", "unbound_sessions",
+        "auxiliary_attempts_without_response",
+        "codex_attempts_without_durable_start_event", "unbound_sessions",
     ]
     assert report["tokens_complete"] is True
     assert report["by_provider_model"] == []

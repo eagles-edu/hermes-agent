@@ -12,6 +12,7 @@ from typing import Any
 from hermes_constants import get_hermes_home
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+ -]{0,127}$")
 _MAX_MODEL_ROWS = 50
 
 PROJECT_USAGE = {
@@ -19,8 +20,10 @@ PROJECT_USAGE = {
     "description": (
         "Read aggregate token usage for the one project ID configured in this Hermes profile. "
         "The local ledger covers Codex app-server turns and Hermes provider API turns with "
-        "explicit project/goal bindings; auxiliary calls outside the active-turn callback, "
-        "attempts without a returned response, and unbound sessions are excluded. "
+        "explicit project/goal bindings; durable Codex starts without a matching end are "
+        "counted as unknown. Auxiliary calls outside the active-turn callback, auxiliary "
+        "attempts without a returned response, attempts without a durable start, and unbound "
+        "sessions are excluded. "
         "The response marks this coverage partial even if every captured turn has reported tokens. "
         "Token totals may already include cache buckets; do not add totals to input/cache values. "
         "The report includes the read time and age of its latest retained event without a "
@@ -54,6 +57,67 @@ def _sum_or_none(value: Any) -> int | None:
     return int(value) if value is not None else None
 
 
+def _unclosed_codex_attempts(
+    connection: sqlite3.Connection, project_id: str,
+) -> tuple[int, str | None, str | None, list[tuple[str, str, int, str | None, str | None]]]:
+    """Count durable bound Codex starts that have no matching end as unknown usage."""
+    tables = {
+        row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "codex_events" not in tables:
+        return 0, None, None, []
+
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(codex_events)")
+    }
+    required = {"project_id", "source_id", "event_type", "occurred_at", "context_json"}
+    if not required.issubset(columns):
+        return 0, None, None, []
+
+    attempts = """
+        WITH starts AS (
+            SELECT event_id, source_id, project_id, occurred_at,
+                   CASE WHEN json_valid(context_json)
+                        THEN json_extract(context_json, '$.attempt_id') END AS attempt_id,
+                   CASE WHEN json_valid(context_json)
+                        THEN json_extract(context_json, '$.provider') END AS provider,
+                   CASE WHEN json_valid(context_json)
+                        THEN json_extract(context_json, '$.model') END AS model
+            FROM codex_events
+            WHERE project_id = ? AND event_type = 'codex:turn:start'
+        ), unmatched AS (
+            SELECT s.event_id, s.occurred_at, s.provider, s.model
+            FROM starts AS s
+            WHERE typeof(s.attempt_id) = 'text'
+              AND NOT EXISTS (
+                  SELECT 1 FROM codex_events AS e
+                  WHERE e.project_id = s.project_id
+                    AND e.source_id = s.source_id
+                    AND e.event_type = 'codex:turn:end'
+                    AND CASE WHEN json_valid(e.context_json)
+                             THEN json_extract(e.context_json, '$.attempt_id') END = s.attempt_id
+              )
+        )
+    """
+    aggregate = connection.execute(
+        attempts + "SELECT COUNT(*), MIN(occurred_at), MAX(occurred_at) FROM unmatched",
+        (project_id,),
+    ).fetchone()
+    groups = connection.execute(
+        attempts + """
+            SELECT COALESCE(provider, 'unknown'), COALESCE(model, 'unknown'),
+                   COUNT(*), MIN(occurred_at), MAX(occurred_at)
+            FROM unmatched
+            GROUP BY COALESCE(provider, 'unknown'), COALESCE(model, 'unknown')
+            ORDER BY COUNT(*) DESC, 1, 2 LIMIT ?
+        """,
+        (project_id, _MAX_MODEL_ROWS + 1),
+    ).fetchall()
+    return int(aggregate[0] or 0), aggregate[1], aggregate[2], groups
+
+
 def _read_usage(project_id: str) -> dict[str, Any]:
     try:
         path = _ledger_path()
@@ -77,6 +141,9 @@ def _read_usage(project_id: str) -> dict[str, Any]:
         if not required.issubset(columns):
             return {"status": "unavailable", "reason": "usage_ledger_schema_unavailable"}
 
+        unclosed_turns, unclosed_first, unclosed_last, unclosed_models = (
+            _unclosed_codex_attempts(connection, project_id)
+        )
         totals = connection.execute(
             """WITH turn_state AS (
                    SELECT turn_id, MAX(usage_status = 'unknown') AS unknown_usage
@@ -115,16 +182,27 @@ def _read_usage(project_id: str) -> dict[str, Any]:
                 (project_id,),
             ).fetchall()
         ]
+        if unclosed_turns and "codex_app_server" not in sources:
+            sources.append("codex_app_server")
+            sources.sort()
         interval = connection.execute(
             "SELECT MIN(occurred_at), MAX(occurred_at) "
             "FROM project_usage_events WHERE project_id = ?",
             (project_id,),
         ).fetchone()
+        first_time_candidates = [
+            value for value in (interval[0], unclosed_first) if isinstance(value, str)
+        ]
+        last_time_candidates = [
+            value for value in (interval[1], unclosed_last) if isinstance(value, str)
+        ]
+        first_occurred_at = min(first_time_candidates, default=None)
+        last_occurred_at = max(last_time_candidates, default=None)
         measured_at = datetime.now(UTC)
         latest_event_age_seconds: int | None = None
-        if isinstance(interval[1], str):
+        if last_occurred_at is not None:
             try:
-                latest_event = datetime.fromisoformat(interval[1])
+                latest_event = datetime.fromisoformat(last_occurred_at)
                 if latest_event.tzinfo is not None:
                     age = measured_at - latest_event.astimezone(UTC)
                     if age >= timedelta(0):
@@ -162,22 +240,58 @@ def _read_usage(project_id: str) -> dict[str, Any]:
             else:
                 entry["unknown_usage_turns"] += int(turns)
 
+        for provider, model, turns, _first_time, _last_time in unclosed_models:
+            provider = (
+                provider if isinstance(provider, str) and _LABEL_RE.fullmatch(provider)
+                else "unknown"
+            )
+            model = model if isinstance(model, str) and _LABEL_RE.fullmatch(model) else "unknown"
+            key = (provider, model)
+            entry = models.setdefault(key, {
+                "provider": provider,
+                "model": model,
+                "turns": 0,
+                "reported_turns": 0,
+                "unknown_usage_turns": 0,
+                "tokens": {
+                    "input": None,
+                    "output": None,
+                    "total": None,
+                    "cache_read": None,
+                    "cache_write": None,
+                    "reasoning": None,
+                },
+            })
+            entry["turns"] += int(turns)
+            entry["unknown_usage_turns"] += int(turns)
+
+        ordered_models = sorted(models.values(), key=lambda item: (item["provider"], item["model"]))
+        model_groups_truncated = (
+            len(model_rows) > _MAX_MODEL_ROWS
+            or len(unclosed_models) > _MAX_MODEL_ROWS
+            or len(ordered_models) > _MAX_MODEL_ROWS
+        )
+
         return {
             "status": "available",
             "project_id": project_id,
             "coverage": (
                 "bound Codex app-server and Hermes provider API turns, including auxiliary "
-                "responses with usage in the active turn; unbound sessions, auxiliary calls "
-                "outside that context, and attempts without a response are excluded"
+                "responses with usage in the active turn; durable Codex starts without a "
+                "matching end count as unknown; unbound sessions, auxiliary calls outside "
+                "that context, auxiliary attempts without a response, and attempts without "
+                "a durable start are excluded"
             ),
             "sources": sources,
-            "turns": int(totals[0] or 0),
+            "turns": int(totals[0] or 0) + unclosed_turns,
             "reported_turns": int(totals[1] or 0),
-            "unknown_usage_turns": int(totals[2] or 0),
-            "measurement_scope": "all_retained_project_usage_rows",
+            "unknown_usage_turns": int(totals[2] or 0) + unclosed_turns,
+            "measurement_scope": (
+                "all_retained_project_usage_rows_and_durable_unclosed_codex_starts"
+            ),
             "measurement_interval": {
-                "first_occurred_at": interval[0],
-                "last_occurred_at": interval[1],
+                "first_occurred_at": first_occurred_at,
+                "last_occurred_at": last_occurred_at,
             },
             "measured_at": measured_at.isoformat(timespec="microseconds"),
             "latest_event_age_seconds": latest_event_age_seconds,
@@ -187,6 +301,7 @@ def _read_usage(project_id: str) -> dict[str, Any]:
             "coverage_exclusions": [
                 "auxiliary_calls_outside_active_turn_context",
                 "auxiliary_attempts_without_response",
+                "codex_attempts_without_durable_start_event",
                 "unbound_sessions",
             ],
             "tokens": {
@@ -197,9 +312,9 @@ def _read_usage(project_id: str) -> dict[str, Any]:
                 "cache_write": _sum_or_none(totals[7]),
                 "reasoning": _sum_or_none(totals[8]),
             },
-            "tokens_complete": int(totals[2] or 0) == 0,
-            "by_provider_model": list(models.values()),
-            "provider_model_groups_truncated": len(model_rows) > _MAX_MODEL_ROWS,
+            "tokens_complete": int(totals[2] or 0) == 0 and unclosed_turns == 0,
+            "by_provider_model": ordered_models[:_MAX_MODEL_ROWS],
+            "provider_model_groups_truncated": model_groups_truncated,
         }
     except sqlite3.Error as exc:
         return {"status": "unavailable", "reason": f"ledger_read_failed:{type(exc).__name__}"}

@@ -90,6 +90,35 @@ def test_summary_omits_unrecognized_or_unbounded_items(tmp_path: Path):
     assert summary.to_json() is None
 
 
+def test_summary_excludes_common_credential_paths_and_bounds_raw_path(tmp_path: Path):
+    summary = CodexWorkSummary(str(tmp_path))
+    paths = (
+        ".aws/credentials",
+        ".ssh/id_ed25519",
+        ".npmrc",
+        "certificates/client.pem",
+        "keys/signing.p12",
+        ".env.production",
+    )
+    summary.observe({
+        "type": "fileChange",
+        "status": "completed",
+        "changes": [
+            {"path": path, "kind": "update"} for path in paths
+        ] + [{"path": "x" * 5000, "kind": "update"}],
+    })
+
+    value = json.loads(summary.to_json() or "{}")
+    assert value["changed_files"] == []
+    assert value["omitted_files"] == len(paths) + 1
+    encoded = json.dumps(value)
+    assert ".aws" not in encoded
+    assert ".ssh" not in encoded
+    assert "npmrc" not in encoded
+    assert "client.pem" not in encoded
+    assert "signing.p12" not in encoded
+
+
 def test_app_server_bridge_collects_only_completed_work_items(tmp_path: Path):
     summary = CodexWorkSummary(str(tmp_path))
     agent = SimpleNamespace(
