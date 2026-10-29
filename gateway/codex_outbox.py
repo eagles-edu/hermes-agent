@@ -62,14 +62,19 @@ _WORK_SUMMARY_PRIVATE_DIRECTORIES = frozenset(
     {".aws", ".azure", ".docker", ".gnupg", ".kube", ".ssh"}
 )
 _WORK_SUMMARY_PRIVATE_SUFFIXES = (".key", ".pem", ".p12", ".pfx", ".jks", ".keystore")
-_WORK_SUMMARY_CREDENTIAL_VALUE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
-    r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b",
-    r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b",
-    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
-    r"\bAKIA[0-9A-Z]{16}\b",
-    r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b",
-    r"\bAIza[0-9A-Za-z_-]{35}\b",
-))
+_WORK_SUMMARY_CREDENTIAL_VALUE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b",
+        r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b",
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+        r"\bAKIA[0-9A-Z]{16}\b",
+        r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b",
+        r"\bAIza[0-9A-Za-z_-]{35}\b",
+        r"\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|"
+        r"client[_-]?secret|secret|password|passwd|pwd|dns[_-]?txt)\s*[=:]\s*[^/\\\s]{4,}",
+    )
+)
 
 
 def _private_work_summary_path(path: str) -> bool:

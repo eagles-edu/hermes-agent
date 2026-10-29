@@ -86,6 +86,8 @@ def test_outbox_rejects_credential_values_embedded_in_changed_paths(tmp_path):
     paths = (
         "docs/sk-proj-" + "a" * 28 + ".md",
         "scripts/github_pat_" + "b" * 24 + ".txt",
+        "docs/password=custom-value.txt",
+        "notes/dns_txt=challenge-value.txt",
     )
     for index, path in enumerate(paths):
         outbox = CodexLifecycleOutbox(
