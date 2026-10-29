@@ -325,3 +325,5 @@ native/fts5_cjk/*.so
 /pm/.lock.json.lock
 
 apps/desktop/.dist-build*
+# Curator V2 project staging is local transient data.
+.curatormd-v2/
