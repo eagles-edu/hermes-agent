@@ -7,6 +7,7 @@ server.py the same way (tests monkeypatching ``server.X`` still intercept)."""
 import contextlib
 
 from .method_ctx import HandlerRegistry, bind_module
+from .methods_session_spawn_tree import _legacy_spawn_tree_entry
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -2244,23 +2245,6 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5000, f"spawn_tree.save failed: {exc}")
     _append_spawn_tree_index(d, {"path": str(path), **meta, "count": len(subagents)})
     return _ok(rid, {"path": str(path), "session_id": session_id})
-
-
-def _legacy_spawn_tree_entry(p, session_dir_name: str) -> dict | None:
-    """Index-shaped entry for a pre-index snapshot file (None when unreadable)."""
-    try:
-        stat = p.stat()
-    except OSError:
-        return None
-    raw = {}
-    with contextlib.suppress(Exception):
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raw = {}
-    subagents = raw.get("subagents") or []
-    return {"path": str(p), "session_id": raw.get("session_id") or session_dir_name,
-            "finished_at": raw.get("finished_at") or stat.st_mtime, "started_at": raw.get("started_at"),
-            "label": raw.get("label") or "", "count": len(subagents) if isinstance(subagents, list) else 0}
 
 
 @method("spawn_tree.list")
