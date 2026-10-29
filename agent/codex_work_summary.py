@@ -22,6 +22,19 @@ _PRIVATE_BASENAMES = {
 }
 _PRIVATE_DIRECTORIES = {".aws", ".azure", ".docker", ".gnupg", ".kube", ".ssh"}
 _PRIVATE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".jks", ".keystore"}
+_PRIVATE_VALUE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b",
+        r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b",
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+        r"\bAKIA[0-9A-Z]{16}\b",
+        r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b",
+        r"\bAIza[0-9A-Za-z_-]{35}\b",
+        r"\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|"
+        r"client[_-]?secret|secret|password|passwd|pwd|dns[_-]?txt)\s*[=:]\s*[^/\\\s]{4,}",
+    )
+)
 _MAX_RAW_PATH_CHARS = 4096
 _MAX_OBSERVED_CHANGES = 256
 _MAX_OMITTED = 1_000_000
@@ -177,6 +190,7 @@ class CodexWorkSummary:
             or basename.endswith(tuple(_PRIVATE_SUFFIXES))
             or any(part in _PRIVATE_DIRECTORIES for part in parts)
             or any(part.startswith((".env", "secret", "credential")) for part in parts)
+            or any(pattern.search(relative) for pattern in _PRIVATE_VALUE_PATTERNS)
         ):
             return None
         return relative

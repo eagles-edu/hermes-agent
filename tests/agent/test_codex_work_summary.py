@@ -99,6 +99,11 @@ def test_summary_excludes_common_credential_paths_and_bounds_raw_path(tmp_path: 
         "certificates/client.pem",
         "keys/signing.p12",
         ".env.production",
+        "docs/sk-proj-" + "a" * 28 + ".md",
+        "scripts/github_pat_" + "b" * 24 + ".txt",
+        "notes/AKIA" + "C" * 16 + ".json",
+        "tmp/xoxb-" + "d" * 22 + ".txt",
+        "config/AIza" + "E" * 35 + ".yaml",
     )
     summary.observe({
         "type": "fileChange",
@@ -117,6 +122,8 @@ def test_summary_excludes_common_credential_paths_and_bounds_raw_path(tmp_path: 
     assert "npmrc" not in encoded
     assert "client.pem" not in encoded
     assert "signing.p12" not in encoded
+    for marker in ("sk-proj-", "github_pat_", "AKIA", "xoxb-", "AIza"):
+        assert marker not in encoded
 
 
 def test_app_server_bridge_collects_only_completed_work_items(tmp_path: Path):
