@@ -1,0 +1,8 @@
+name: curator-v2
+description: Send approved, bounded Codex turn facts to the profile's Curator V2 project.
+events:
+  - codex:turn:start
+  - codex:turn:end
+durable_events:
+  - codex:turn:start
+  - codex:turn:end
