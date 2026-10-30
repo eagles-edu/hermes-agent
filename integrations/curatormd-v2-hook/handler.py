@@ -140,7 +140,7 @@ def handle(event_type: str, context: Mapping[str, Any], *, ctx: Any) -> bool | N
             session_id=payload["context"]["session_id"],
             hermes_durable_event=True,
         )
-    except Exception:
+    except Exception:  # health: allow BLE001 -- retry failed delivery without logging payload details.
         return False
     return _matching_receipt(
         response,
