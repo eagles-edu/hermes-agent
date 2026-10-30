@@ -87,7 +87,6 @@ def _payload(event_type: str, context: Mapping[str, Any]) -> dict[str, Any] | No
 
     return {
         "event_type": event_type,
-        "project_id": context["project_id"],
         "goal_id": context["goal_id"],
         "event_id": context["event_id"],
         "source_id": context["source_id"],
@@ -145,6 +144,6 @@ def handle(event_type: str, context: Mapping[str, Any], *, ctx: Any) -> bool | N
         return False
     return _matching_receipt(
         response,
-        project_id=payload["project_id"],
+        project_id=context["project_id"],
         event_id=payload["event_id"],
     )

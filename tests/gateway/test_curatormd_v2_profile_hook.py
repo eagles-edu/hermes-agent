@@ -70,7 +70,10 @@ def test_profile_hook_sends_only_bounded_fields_and_requires_matching_receipt():
     args, kwargs = context.calls[0]
     assert args[0:2] == ("curator_v2", "hermes_codex_event")
     event = args[2]
-    assert event["project_id"] == "hermes-core-v2-alpha"
+    assert set(event) == {
+        "event_type", "goal_id", "event_id", "source_id",
+        "source_sequence", "occurred_at", "context",
+    }
     assert event["event_id"] == "event-alpha"
     assert event["context"]["work_summary_json"].startswith('{"schema_version"')
     assert "prompt" not in event and "command_output" not in event
