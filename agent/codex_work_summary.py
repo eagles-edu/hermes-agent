@@ -22,6 +22,15 @@ _PRIVATE_BASENAMES = {
 }
 _PRIVATE_DIRECTORIES = {".aws", ".azure", ".docker", ".gnupg", ".kube", ".ssh"}
 _PRIVATE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".jks", ".keystore"}
+_PRIVATE_PATH_COMPONENT = re.compile(
+    r"(?:^|[._-])(?:\.env|\.secret|secret|credential|passphrase|password|passwd|pwd|token|"
+    r"api[_-]?(?:key|secret|token)|(?:access|refresh)[_-]?(?:key|token)|"
+    r"(?:auth|secret|session)[_-]?(?:key|token)|bearer[_-]?(?:token|key)|"
+    r"oauth[_-]?client[_-]?secret|"
+    r"aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key(?:[_-]?id)?)|"
+    r"client[_-]?secret|private[_-]?key|authorization|bearer|cookie)s?(?:$|[._-])",
+    re.IGNORECASE,
+)
 _PRIVATE_VALUE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -31,6 +40,12 @@ _PRIVATE_VALUE_PATTERNS = tuple(
         r"\bAKIA[0-9A-Z]{16}\b",
         r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b",
         r"\bAIza[0-9A-Za-z_-]{35}\b",
+        r"\b(?:TXT(?:\s+(?:record|value))?|DNS\s+(?:challenge|TXT)"
+        r"(?:\s+(?:value|code|token))?)\s*[:=]\s*[\"']?[A-Za-z0-9_-]{32,}\b",
+        r"\b(?:manual\s+)?DNS\s+(?:TXT\s+)?(?:code|challenge|value)"
+        r"\s*(?::|=|\bis\b)\s*[\"']?[A-Za-z0-9_-]{12,}\b",
+        r"\b(?:manual[-_ ]dns|dns)[-_ ](?:txt|challenge|code|token|value)"
+        r"[-_]+[A-Za-z0-9_-]{12,}\b",
         r"\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|"
         r"client[_-]?secret|secret|password|passwd|pwd|dns[_-]?txt)\s*[=:]\s*[^/\\\s]{4,}",
     )
@@ -119,6 +134,7 @@ class CodexWorkSummary:
             self._root = None
         self._files: dict[str, str] = {}
         self._checks: list[dict[str, Any]] = []
+        self._seen_checks: set[tuple[str, int]] = set()
         self._omitted_files = 0
         self._omitted_checks = 0
 
@@ -189,7 +205,7 @@ class CodexWorkSummary:
             or basename in _PRIVATE_BASENAMES
             or basename.endswith(tuple(_PRIVATE_SUFFIXES))
             or any(part in _PRIVATE_DIRECTORIES for part in parts)
-            or any(part.startswith((".env", "secret", "credential")) for part in parts)
+            or any(_PRIVATE_PATH_COMPONENT.search(part) for part in parts)
             or any(pattern.search(relative) for pattern in _PRIVATE_VALUE_PATTERNS)
         ):
             return None
@@ -200,6 +216,10 @@ class CodexWorkSummary:
         exit_code = item.get("exitCode")
         if label is None or type(exit_code) is not int or not 0 <= exit_code <= 255:
             return
+        check_key = (label, exit_code)
+        if check_key in self._seen_checks:
+            return
+        self._seen_checks.add(check_key)
         entry = {"name": label, "exit_code": exit_code}
         if len(self._checks) < _MAX_CHECKS:
             self._checks.append(entry)

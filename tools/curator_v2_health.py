@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from contextlib import closing
 from datetime import UTC, datetime
 import os
@@ -28,9 +29,12 @@ _PROBED_DEPENDENCIES = (
     "human_review",
     "artifact_producer_inventory",
 )
+_CURATOR_HOOK_EVENTS = frozenset({"codex:turn:start", "codex:turn:end"})
+_HOOK_CODE_LIMIT = 65_536
 _PURGE_SCHEDULER_FRESHNESS_US = 64_800_000_000
-_SYSTEMD_MONOTONIC_PART = re.compile(r"(\d+(?:\.\d+)?)(min|ms|us|d|h|s)")
+_SYSTEMD_MONOTONIC_PART = re.compile(r"(\d+(?:\.\d+)?)(min|ms|us|w|d|h|s)")
 _SYSTEMD_MONOTONIC_FACTORS = {
+    "w": 604_800_000_000,
     "d": 86_400_000_000,
     "h": 3_600_000_000,
     "min": 60_000_000,
@@ -131,27 +135,91 @@ def _storage_ready(database: Path | None) -> bool | None:
         return None
 
 
+def _handler_events(source: str) -> frozenset[str] | None:
+    """Read the hook entry point's literal supported-event declaration."""
+
+    tree = ast.parse(source, filename="curator-v2-handler")
+    if not any(
+        isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and statement.name == "handle"
+        for statement in tree.body
+    ):
+        return None
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+            value = statement.value
+        else:
+            continue
+        if not any(
+            isinstance(target, ast.Name)
+            and target.id in {"SUPPORTED_EVENTS", "_EVENTS"}
+            for target in targets
+        ):
+            continue
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in {"set", "frozenset"}
+            and len(value.args) == 1
+            and not value.keywords
+        ):
+            value = value.args[0]
+        try:
+            events = ast.literal_eval(value)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(events, (set, list, tuple)) and all(
+            isinstance(event, str) and 0 < len(event) <= 64 for event in events
+        ):
+            return frozenset(events)
+        return None
+    return None
+
+
 def _producer_inventory_ready(home: Path) -> bool | None:
-    """Check the installed profile hook manifest is bounded and internally valid."""
+    """Check the profile hook manifest and installed handler are usable."""
 
     path = home / "hooks" / "curator-v2" / "HOOK.yaml"
+    handler_path = path.parent / "handler.py"
     try:
         if not path.is_file() or path.stat().st_size > 16_384:
             return None
         with path.open("r", encoding="utf-8-sig") as stream:
             manifest = yaml.safe_load(stream)
-        if not isinstance(manifest, dict):
+        if not isinstance(manifest, dict) or manifest.get("name") != "curator-v2":
             return False
         events = manifest.get("events")
-        durable = manifest.get("durable_events", [])
-        return (
-            isinstance(events, list)
-            and bool(events)
-            and all(isinstance(event, str) and 1 <= len(event) <= 64 for event in events)
-            and isinstance(durable, list)
-            and all(event in events for event in durable)
-        )
-    except (OSError, UnicodeError, ValueError, yaml.YAMLError):
+        durable = manifest.get("durable_events")
+        if (
+            not isinstance(events, list)
+            or not events
+            or len(events) > 16
+            or any(
+                not isinstance(event, str) or not 1 <= len(event) <= 64
+                for event in events
+            )
+            or len(set(events)) != len(events)
+            or not isinstance(durable, list)
+            or len(durable) != len(_CURATOR_HOOK_EVENTS)
+            or any(not isinstance(event, str) for event in durable)
+            or set(durable) != _CURATOR_HOOK_EVENTS
+            or not _CURATOR_HOOK_EVENTS <= set(events)
+        ):
+            return False
+        if not handler_path.is_file() or handler_path.stat().st_size > _HOOK_CODE_LIMIT:
+            return False
+        source = handler_path.read_text(encoding="utf-8-sig")
+        supported_events = _handler_events(source)
+        return supported_events is not None and set(events) <= supported_events
+    except SyntaxError:
+        return False
+    except UnicodeError:
+        return False
+    except (OSError, ValueError, yaml.YAMLError):
         return None
 
 

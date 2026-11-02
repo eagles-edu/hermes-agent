@@ -64,6 +64,59 @@ def test_summary_records_nonzero_exit_code_without_command_or_output(tmp_path: P
     assert "secret" not in json.dumps(value)
 
 
+def test_summary_deduplicates_identical_checks_before_omission_limit(tmp_path: Path):
+    summary = CodexWorkSummary(str(tmp_path))
+    for _ in range(20):
+        summary.observe({
+            "type": "commandExecution",
+            "command": "pytest tests/example.py",
+            "exitCode": 0,
+            "aggregatedOutput": "discarded",
+        })
+    summary.observe({
+        "type": "commandExecution",
+        "command": "pytest tests/example.py",
+        "exitCode": 1,
+    })
+    summary.observe({
+        "type": "commandExecution",
+        "command": "pytest tests/example.py",
+        "exitCode": 1,
+    })
+    for code in range(6):
+        summary.observe({
+            "type": "commandExecution",
+            "command": "scripts/check",
+            "exitCode": code,
+        })
+    summary.observe({
+        "type": "commandExecution",
+        "command": "pytest tests/example.py",
+        "exitCode": 0,
+    })
+    summary.observe({
+        "type": "commandExecution",
+        "command": "pytest tests/example.py",
+        "exitCode": 1,
+    })
+    summary.observe({
+        "type": "commandExecution",
+        "command": "scripts/check",
+        "exitCode": 6,
+    })
+    summary.observe({
+        "type": "commandExecution",
+        "command": "scripts/check",
+        "exitCode": 6,
+    })
+
+    value = json.loads(summary.to_json() or "{}")
+    assert len(value["checks"]) == 8
+    assert value["checks"][0] == {"name": "pytest", "exit_code": 0}
+    assert value["checks"][1] == {"name": "pytest", "exit_code": 1}
+    assert value["omitted_checks"] == 1
+
+
 def test_summary_omits_unrecognized_or_unbounded_items(tmp_path: Path):
     summary = CodexWorkSummary(str(tmp_path))
     summary.observe({
@@ -90,6 +143,22 @@ def test_summary_omits_unrecognized_or_unbounded_items(tmp_path: Path):
     assert summary.to_json() is None
 
 
+def test_summary_omits_passphrase_paths_before_durable_outbox(tmp_path: Path):
+    private_file = tmp_path / "passphrase.txt"
+    private_file.write_text("credential material", encoding="utf-8")
+    summary = CodexWorkSummary(str(tmp_path))
+    summary.observe({
+        "type": "fileChange",
+        "status": "completed",
+        "changes": [{"path": str(private_file), "kind": "update"}],
+    })
+
+    value = json.loads(summary.to_json() or "{}")
+    assert value["changed_files"] == []
+    assert value["omitted_files"] == 1
+    assert "passphrase" not in json.dumps(value)
+
+
 def test_summary_excludes_common_credential_paths_and_bounds_raw_path(tmp_path: Path):
     summary = CodexWorkSummary(str(tmp_path))
     paths = (
@@ -99,11 +168,21 @@ def test_summary_excludes_common_credential_paths_and_bounds_raw_path(tmp_path: 
         "certificates/client.pem",
         "keys/signing.p12",
         ".env.production",
+        "config/aws_secret_access_key",
+        "config/access_key_id",
+        "config/session_key.txt",
+        "browser/cookies.json",
+        "config/MY_AWS_SECRET_ACCESS_KEY",
+        "config/OAUTH_CLIENT_SECRET",
+        "browser/MY_BEARER_TOKEN",
         "docs/sk-proj-" + "a" * 28 + ".md",
         "scripts/github_pat_" + "b" * 24 + ".txt",
         "notes/AKIA" + "C" * 16 + ".json",
         "tmp/xoxb-" + "d" * 22 + ".txt",
         "config/AIza" + "E" * 35 + ".yaml",
+        "notes/manual DNS code is Q7mN4pL8xW2cR6vB.txt",
+        "notes/dns-challenge-Q7mN4pL8xW2cR6vB.txt",
+        "notes/manual_dns_txt_Q7mN4pL8xW2cR6vB.txt",
     )
     summary.observe({
         "type": "fileChange",
@@ -122,7 +201,10 @@ def test_summary_excludes_common_credential_paths_and_bounds_raw_path(tmp_path: 
     assert "npmrc" not in encoded
     assert "client.pem" not in encoded
     assert "signing.p12" not in encoded
-    for marker in ("sk-proj-", "github_pat_", "AKIA", "xoxb-", "AIza"):
+    for marker in (
+        "sk-proj-", "github_pat_", "AKIA", "xoxb-", "AIza",
+        "Q7mN4pL8xW2cR6vB",
+    ):
         assert marker not in encoded
 
 

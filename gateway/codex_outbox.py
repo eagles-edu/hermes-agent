@@ -62,6 +62,15 @@ _WORK_SUMMARY_PRIVATE_DIRECTORIES = frozenset(
     {".aws", ".azure", ".docker", ".gnupg", ".kube", ".ssh"}
 )
 _WORK_SUMMARY_PRIVATE_SUFFIXES = (".key", ".pem", ".p12", ".pfx", ".jks", ".keystore")
+_WORK_SUMMARY_PRIVATE_COMPONENT = re.compile(
+    r"(?:^|[._-])(?:\.env|\.secret|secret|credential|passphrase|password|passwd|pwd|token|"
+    r"api[_-]?(?:key|secret|token)|(?:access|refresh)[_-]?(?:key|token)|"
+    r"(?:auth|secret|session)[_-]?(?:key|token)|bearer[_-]?(?:token|key)|"
+    r"oauth[_-]?client[_-]?secret|"
+    r"aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key(?:[_-]?id)?)|"
+    r"client[_-]?secret|private[_-]?key|authorization|bearer|cookie)s?(?:$|[._-])",
+    re.IGNORECASE,
+)
 _WORK_SUMMARY_CREDENTIAL_VALUE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -71,6 +80,12 @@ _WORK_SUMMARY_CREDENTIAL_VALUE_PATTERNS = tuple(
         r"\bAKIA[0-9A-Z]{16}\b",
         r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b",
         r"\bAIza[0-9A-Za-z_-]{35}\b",
+        r"\b(?:TXT(?:\s+(?:record|value))?|DNS\s+(?:challenge|TXT)"
+        r"(?:\s+(?:value|code|token))?)\s*[:=]\s*[\"']?[A-Za-z0-9_-]{32,}\b",
+        r"\b(?:manual\s+)?DNS\s+(?:TXT\s+)?(?:code|challenge|value)"
+        r"\s*(?::|=|\bis\b)\s*[\"']?[A-Za-z0-9_-]{12,}\b",
+        r"\b(?:manual[-_ ]dns|dns)[-_ ](?:txt|challenge|code|token|value)"
+        r"[-_]+[A-Za-z0-9_-]{12,}\b",
         r"\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|"
         r"client[_-]?secret|secret|password|passwd|pwd|dns[_-]?txt)\s*[=:]\s*[^/\\\s]{4,}",
     )
@@ -86,7 +101,7 @@ def _private_work_summary_path(path: str) -> bool:
         basename in _WORK_SUMMARY_PRIVATE_NAMES
         or basename.endswith(_WORK_SUMMARY_PRIVATE_SUFFIXES)
         or any(part in _WORK_SUMMARY_PRIVATE_DIRECTORIES for part in parts)
-        or any(part.startswith((".env", "secret", "credential")) for part in parts)
+        or any(_WORK_SUMMARY_PRIVATE_COMPONENT.search(part) for part in parts)
         or any(pattern.search(path) for pattern in _WORK_SUMMARY_CREDENTIAL_VALUE_PATTERNS)
     )
 
@@ -103,7 +118,7 @@ def _valid_work_summary(value: object) -> bool:
     if not isinstance(decoded, dict) or set(decoded) != {
         "schema_version", "repository_fingerprint", "changed_files",
         "omitted_files", "checks", "omitted_checks",
-    } or decoded.get("schema_version") != 1:
+    } or type(decoded.get("schema_version")) is not int or decoded.get("schema_version") != 1:
         return False
     fingerprint = decoded.get("repository_fingerprint")
     files, checks = decoded.get("changed_files"), decoded.get("checks")
@@ -124,6 +139,7 @@ def _valid_work_summary(value: object) -> bool:
             not isinstance(path, str) or not _WORK_SUMMARY_PATH_RE.fullmatch(path)
             or path.startswith("/") or ".." in path.split("/")
             or _private_work_summary_path(path)
+            or not isinstance(change, str)
             or change not in {"add", "update", "delete", "rename"}
         ):
             return False
@@ -131,7 +147,8 @@ def _valid_work_summary(value: object) -> bool:
         if not isinstance(item, dict) or set(item) != {"name", "exit_code"}:
             return False
         if (
-            item.get("name") not in _WORK_SUMMARY_CHECKS
+            not isinstance(item.get("name"), str)
+            or item.get("name") not in _WORK_SUMMARY_CHECKS
             or type(item.get("exit_code")) is not int
             or not 0 <= item["exit_code"] <= 255
         ):

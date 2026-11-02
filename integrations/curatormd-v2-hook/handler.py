@@ -14,6 +14,45 @@ _END_CONTEXT_FIELDS = _START_CONTEXT_FIELDS | frozenset(
     {"turn_id", "outcome", "failure_kind", "work_summary_json"}
 )
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_SUMMARY_PATH = re.compile(r"^[A-Za-z0-9_./ @+-]{1,256}$")
+_SUMMARY_CHECKS = frozenset(
+    {"scripts/check", "scripts/run_tests.sh", "git diff --check", "pytest", "npm test"}
+)
+_SUMMARY_CHANGES = frozenset({"add", "update", "delete", "rename"})
+_SUMMARY_PRIVATE_NAMES = frozenset({
+    ".env", ".npmrc", ".pypirc", ".netrc", "credentials", "secrets",
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "authorized_keys",
+    "known_hosts", "application_default_credentials.json",
+})
+_SUMMARY_PRIVATE_DIRECTORIES = frozenset(
+    {".aws", ".azure", ".docker", ".gnupg", ".kube", ".ssh"}
+)
+_SUMMARY_PRIVATE_COMPONENT = re.compile(
+    r"(?:^|[._-])(?:\.env|\.secret|secret|credential|passphrase|password|passwd|pwd|token|"
+    r"api[_-]?(?:key|secret|token)|(?:access|refresh)[_-]?(?:key|token)|"
+    r"(?:auth|secret|session)[_-]?(?:key|token)|bearer[_-]?(?:token|key)|"
+    r"oauth[_-]?client[_-]?secret|"
+    r"aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key(?:[_-]?id)?)|"
+    r"client[_-]?secret|private[_-]?key|authorization|bearer|cookie)s?(?:$|[._-])",
+    re.IGNORECASE,
+)
+_SUMMARY_PRIVATE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b",
+    r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b",
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b",
+    r"\bAIza[0-9A-Za-z_-]{35}\b",
+    r"\b(?:TXT(?:\s+(?:record|value))?|DNS\s+(?:challenge|TXT)"
+    r"(?:\s+(?:value|code|token))?)\s*[:=]\s*[\"']?[A-Za-z0-9_-]{32,}\b",
+    r"\b(?:manual\s+)?DNS\s+(?:TXT\s+)?(?:code|challenge|value)"
+    r"\s*(?::|=|\bis\b)\s*[\"']?[A-Za-z0-9_-]{12,}\b",
+    r"\b(?:manual[-_ ]dns|dns)[-_ ](?:txt|challenge|code|token|value)"
+    r"[-_]+[A-Za-z0-9_-]{12,}\b",
+    r"\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|"
+    r"client[_-]?secret|secret|password|passwd|pwd|dns[_-]?txt)"
+    r"\s*[=:]\s*[^/\\\s]{4,}",
+))
 
 
 def _text(value: object, maximum: int) -> bool:
@@ -22,6 +61,74 @@ def _text(value: object, maximum: int) -> bool:
         and 1 <= len(value) <= maximum
         and not any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
     )
+
+
+def _private_summary_path(path: str) -> bool:
+    parts = tuple(part.lower() for part in path.split("/"))
+    basename = parts[-1] if parts else ""
+    return (
+        basename in _SUMMARY_PRIVATE_NAMES
+        or basename.endswith((".key", ".pem", ".p12", ".pfx", ".jks", ".keystore"))
+        or any(part in _SUMMARY_PRIVATE_DIRECTORIES for part in parts)
+        or any(_SUMMARY_PRIVATE_COMPONENT.search(part) for part in parts)
+        or any(pattern.search(path) for pattern in _SUMMARY_PRIVATE_PATTERNS)
+    )
+
+
+def _valid_work_summary(value: object) -> bool:
+    """Accept only the bounded summary schema, rejecting raw fields and secrets."""
+    if not isinstance(value, str) or not 1 <= len(value) <= 4096:
+        return False
+    try:
+        if len(value.encode("utf-8")) > 4096:
+            return False
+        summary = json.loads(value)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        return False
+    if not isinstance(summary, dict) or set(summary) != {
+        "schema_version", "repository_fingerprint", "changed_files",
+        "omitted_files", "checks", "omitted_checks",
+    }:
+        return False
+    if (
+        type(summary.get("schema_version")) is not int
+        or summary["schema_version"] != 1
+        or not isinstance(summary.get("repository_fingerprint"), str)
+        or not re.fullmatch(r"[a-f0-9]{64}", summary["repository_fingerprint"])
+    ):
+        return False
+    changed_files, checks = summary.get("changed_files"), summary.get("checks")
+    if (
+        not isinstance(changed_files, list) or len(changed_files) > 16
+        or not isinstance(checks, list) or len(checks) > 8
+        or type(summary.get("omitted_files")) is not int
+        or not 0 <= summary["omitted_files"] <= 1_000_000
+        or type(summary.get("omitted_checks")) is not int
+        or not 0 <= summary["omitted_checks"] <= 1_000_000
+    ):
+        return False
+    for item in changed_files:
+        if not isinstance(item, dict) or set(item) != {"path", "change"}:
+            return False
+        path, change = item.get("path"), item.get("change")
+        if (
+            not isinstance(path, str) or not _SUMMARY_PATH.fullmatch(path)
+            or path.startswith("/") or ".." in path.split("/")
+            or _private_summary_path(path)
+            or not isinstance(change, str) or change not in _SUMMARY_CHANGES
+        ):
+            return False
+    for item in checks:
+        if not isinstance(item, dict) or set(item) != {"name", "exit_code"}:
+            return False
+        if (
+            not isinstance(item.get("name"), str)
+            or item["name"] not in _SUMMARY_CHECKS
+            or type(item.get("exit_code")) is not int
+            or not 0 <= item["exit_code"] <= 255
+        ):
+            return False
+    return True
 
 
 def _payload(event_type: str, context: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -71,19 +178,12 @@ def _payload(event_type: str, context: Mapping[str, Any]) -> dict[str, Any] | No
         ):
             return None
     summary = event_context.get("work_summary_json")
-    if summary is not None:
-        if (
-            event_type != "codex:turn:end"
-            or not _text(summary, 4096)
-            or len(summary.encode("utf-8")) > 4096
-        ):
-            return None
-        try:
-            decoded = json.loads(summary)
-        except (TypeError, ValueError):
-            return None
-        if not isinstance(decoded, dict) or decoded.get("schema_version") != 1:
-            return None
+    if summary is not None and (
+        event_type != "codex:turn:end" or not _valid_work_summary(summary)
+    ):
+        # The summary is optional. Drop malformed or sensitive metadata but
+        # still deliver the bounded lifecycle event so the outbox can advance.
+        event_context.pop("work_summary_json", None)
 
     return {
         "event_type": event_type,

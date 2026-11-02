@@ -7,7 +7,11 @@ import sqlite3
 import subprocess
 from unittest.mock import patch
 
-from tools.curator_v2_health import _purge_scheduler_ready, curator_v2_readiness
+from tools.curator_v2_health import (
+    _producer_inventory_ready,
+    _purge_scheduler_ready,
+    curator_v2_readiness,
+)
 
 
 def test_curator_readiness_reports_observed_local_state(tmp_path):
@@ -36,8 +40,13 @@ def test_curator_readiness_reports_observed_local_state(tmp_path):
     hooks = home / "hooks" / "curator-v2"
     hooks.mkdir(parents=True)
     (hooks / "HOOK.yaml").write_text(
-        "\ufeffevents:\n  - codex:turn:start\n  - codex:turn:end\n"
+        "\ufeffname: curator-v2\nevents:\n  - codex:turn:start\n  - codex:turn:end\n"
         "durable_events:\n  - codex:turn:start\n  - codex:turn:end\n",
+        encoding="utf-8",
+    )
+    (hooks / "handler.py").write_text(
+        "SUPPORTED_EVENTS = frozenset({'codex:turn:start', 'codex:turn:end'})\n"
+        "def handle(event_type, context, *, ctx):\n    return True\n",
         encoding="utf-8",
     )
     with patch("tools.curator_v2_health._purge_scheduler_ready", return_value=False), patch(
@@ -83,14 +92,109 @@ def test_curator_readiness_keeps_missing_probe_sources_unknown(tmp_path):
     assert result["purge_scheduler"]["ready"] is False
 
 
+def test_producer_inventory_checks_symlinked_manifest_and_handler(tmp_path):
+    home = tmp_path / "profile"
+    source = tmp_path / "hook-source"
+    source.mkdir()
+    (source / "HOOK.yaml").write_text(
+        "name: curator-v2\nevents:\n  - codex:turn:start\n  - codex:turn:end\n"
+        "durable_events:\n  - codex:turn:start\n  - codex:turn:end\n",
+        encoding="utf-8",
+    )
+    handler = source / "handler.py"
+    handler.write_text(
+        "SUPPORTED_EVENTS = frozenset({'codex:turn:start', 'codex:turn:end'})\n"
+        "def handle(event_type, context, *, ctx):\n    return True\n",
+        encoding="utf-8",
+    )
+    hook_link = home / "hooks" / "curator-v2"
+    hook_link.parent.mkdir(parents=True)
+    hook_link.symlink_to(source, target_is_directory=True)
+
+    assert _producer_inventory_ready(home) is True
+    handler.write_text("def handle(:\n", encoding="utf-8")
+    assert _producer_inventory_ready(home) is False
+    handler.unlink()
+    assert _producer_inventory_ready(home) is False
+
+
+def test_producer_inventory_accepts_supported_non_durable_hook_event(tmp_path):
+    hooks = tmp_path / "hooks" / "curator-v2"
+    hooks.mkdir(parents=True)
+    (hooks / "HOOK.yaml").write_text(
+        "name: curator-v2\nevents:\n  - agent:start\n"
+        "  - codex:turn:start\n  - codex:turn:end\n"
+        "durable_events:\n  - codex:turn:start\n  - codex:turn:end\n",
+        encoding="utf-8",
+    )
+    (hooks / "handler.py").write_text(
+        "SUPPORTED_EVENTS = frozenset({"
+        "'agent:start', 'codex:turn:start', 'codex:turn:end'})\n"
+        "def handle(event_type, context, *, ctx):\n    return True\n",
+        encoding="utf-8",
+    )
+
+    assert _producer_inventory_ready(tmp_path) is True
+
+    (hooks / "handler.py").write_text(
+        "SUPPORTED_EVENTS = frozenset({'codex:turn:start', 'codex:turn:end'})\n"
+        "def handle(event_type, context, *, ctx):\n    return True\n",
+        encoding="utf-8",
+    )
+    assert _producer_inventory_ready(tmp_path) is False
+
+
+def test_producer_inventory_rejects_event_declaration_without_handler(tmp_path):
+    hooks = tmp_path / "hooks" / "curator-v2"
+    hooks.mkdir(parents=True)
+    (hooks / "HOOK.yaml").write_text(
+        "name: curator-v2\nevents:\n  - codex:turn:start\n  - codex:turn:end\n"
+        "durable_events:\n  - codex:turn:start\n  - codex:turn:end\n",
+        encoding="utf-8",
+    )
+    (hooks / "handler.py").write_text(
+        "SUPPORTED_EVENTS = frozenset({'codex:turn:start', 'codex:turn:end'})\n",
+        encoding="utf-8",
+    )
+
+    assert _producer_inventory_ready(tmp_path) is False
+
+
+def test_producer_inventory_rejects_unknown_or_non_durable_events(tmp_path):
+    hooks = tmp_path / "hooks" / "curator-v2"
+    hooks.mkdir(parents=True)
+    manifest = hooks / "HOOK.yaml"
+    handler = hooks / "handler.py"
+    handler.write_text("def handle():\n    return True\n", encoding="utf-8")
+
+    manifest.write_text(
+        "name: curator-v2\nevents:\n  - codex:turn:start\n  - codex:turn:other\n"
+        "durable_events:\n  - codex:turn:start\n  - codex:turn:other\n",
+        encoding="utf-8",
+    )
+    assert _producer_inventory_ready(tmp_path) is False
+
+    manifest.write_text(
+        "name: curator-v2\nevents:\n  - codex:turn:start\n  - codex:turn:end\n"
+        "durable_events:\n  - codex:turn:start\n",
+        encoding="utf-8",
+    )
+    assert _producer_inventory_ready(tmp_path) is False
+
+
 def test_purge_scheduler_requires_fresh_enabled_timer_and_successful_run(monkeypatch):
-    now_us = 100_000_000_000
-    trigger_us = now_us - 17 * 60 * 60 * 1_000_000
+    trigger_us = (
+        7 * 24 * 60 * 60 * 1_000_000
+        + 60 * 60 * 1_000_000
+        + 43 * 60 * 1_000_000
+        + 7_882_991
+    )
+    now_us = trigger_us + 17 * 60 * 60 * 1_000_000
     service_start_us = trigger_us + 1_000_000
     outputs = iter(
         (
             "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n"
-            f"LastTriggerUSecMonotonic={trigger_us}\n",
+            "LastTriggerUSecMonotonic=1w 1h 43min 7.882991s\n",
             "LoadState=loaded\nActiveState=inactive\nResult=success\n"
             f"ExecMainStartTimestampMonotonic={service_start_us}\n",
         )

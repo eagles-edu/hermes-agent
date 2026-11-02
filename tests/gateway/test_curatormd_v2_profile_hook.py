@@ -1,6 +1,7 @@
 """Behavior tests for the profile-local Curator V2 durable hook."""
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -42,9 +43,8 @@ def _event_context(**overrides):
         "turn_id": "turn-alpha",
         "outcome": "completed",
         "work_summary_json": (
-            '{"schema_version":1,"repository_fingerprint":"'
-            + "a" * 64
-            + '"}'
+            '{"schema_version":1,"repository_fingerprint":"' + "a" * 64
+            + '","changed_files":[],"omitted_files":0,"checks":[],"omitted_checks":0}'
         ),
         "prompt": "must not be forwarded",
         "command_output": "must not be forwarded",
@@ -122,10 +122,67 @@ def test_profile_hook_does_not_acknowledge_a_different_or_failed_receipt():
     assert handle("codex:turn:start", _event_context(), ctx=context) is False
 
 
-def test_profile_hook_rejects_malformed_events_without_calling_curator():
-    context = _HookContext({"ok": True, "result": {}})
+def test_profile_hook_drops_bad_summary_but_rejects_malformed_lifecycle_event():
+    context = _HookContext({
+        "ok": True,
+        "truncated": False,
+        "result": {
+            "project_id": "hermes-core-v2-alpha",
+            "event_id": "event-alpha",
+            "status": "processed",
+        },
+    })
     assert handle("codex:turn:start", _event_context(source_sequence=True), ctx=context) is False
-    assert handle("codex:turn:end", _event_context(work_summary_json="raw text"), ctx=context) is False
+    assert handle("codex:turn:end", _event_context(work_summary_json="raw text"), ctx=context) is True
+    forwarded = context.calls[-1][0][2]["context"]
+    assert "work_summary_json" not in forwarded
     assert handle("codex:turn:end", _event_context(outcome=[]), ctx=context) is False
     assert handle("agent:end", _event_context(), ctx=context) is None
-    assert context.calls == []
+    assert len(context.calls) == 1
+
+
+def test_profile_hook_drops_unapproved_summary_fields_and_sensitive_paths():
+    context = _HookContext({
+        "ok": True,
+        "truncated": False,
+        "result": {
+            "project_id": "hermes-core-v2-alpha",
+            "event_id": "event-alpha",
+            "status": "processed",
+        },
+    })
+    forged = _event_context(work_summary_json=(
+        '{"schema_version":1,"repository_fingerprint":"' + "a" * 64
+        + '","changed_files":[],"omitted_files":0,"checks":[],"omitted_checks":0,'
+        '"prompt":"private prompt"}'
+    ))
+    assert handle("codex:turn:end", forged, ctx=context) is True
+    assert "work_summary_json" not in context.calls[-1][0][2]["context"]
+    assert "private prompt" not in str(context.calls[-1])
+
+    private_paths = (
+        "notes/manual DNS code is Q7mN4pL8xW2cR6vB.txt",
+        "docs/passwords.txt",
+        "docs/passphrase.txt",
+        "config/api_token.json",
+        "config/aws_secret_access_key",
+        "config/access_key_id",
+        "config/session_key.txt",
+        "browser/cookies.json",
+        "config/MY_AWS_SECRET_ACCESS_KEY",
+        "config/OAUTH_CLIENT_SECRET",
+        "browser/MY_BEARER_TOKEN",
+        "local/refresh-token.cache",
+        "deploy/client_secret.yml",
+        "notes/private_key.backup",
+    )
+    for private_path in private_paths:
+        payload = json.loads(_event_context()["work_summary_json"])
+        payload["changed_files"] = [{"path": private_path, "change": "update"}]
+        assert handle(
+            "codex:turn:end",
+            _event_context(work_summary_json=json.dumps(payload)),
+            ctx=context,
+        ) is True
+        assert "work_summary_json" not in context.calls[-1][0][2]["context"]
+        assert private_path not in str(context.calls[-1])
