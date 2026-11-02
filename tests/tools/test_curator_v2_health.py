@@ -160,6 +160,23 @@ def test_producer_inventory_rejects_event_declaration_without_handler(tmp_path):
     assert _producer_inventory_ready(tmp_path) is False
 
 
+def test_producer_inventory_rejects_handler_that_cannot_accept_hook_arguments(tmp_path):
+    hooks = tmp_path / "hooks" / "curator-v2"
+    hooks.mkdir(parents=True)
+    (hooks / "HOOK.yaml").write_text(
+        "name: curator-v2\nevents:\n  - codex:turn:start\n  - codex:turn:end\n"
+        "durable_events:\n  - codex:turn:start\n  - codex:turn:end\n",
+        encoding="utf-8",
+    )
+    (hooks / "handler.py").write_text(
+        "SUPPORTED_EVENTS = frozenset({'codex:turn:start', 'codex:turn:end'})\n"
+        "def handle():\n    return True\n",
+        encoding="utf-8",
+    )
+
+    assert _producer_inventory_ready(tmp_path) is False
+
+
 def test_producer_inventory_rejects_unknown_or_non_durable_events(tmp_path):
     hooks = tmp_path / "hooks" / "curator-v2"
     hooks.mkdir(parents=True)

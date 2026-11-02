@@ -145,6 +145,22 @@ def _handler_events(source: str) -> frozenset[str] | None:
         for statement in tree.body
     ):
         return None
+    handler = next(
+        statement
+        for statement in tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and statement.name == "handle"
+    )
+    arguments = handler.args
+    positional = (*arguments.posonlyargs, *arguments.args)
+    accepts_event_context = len(positional) >= 2 or arguments.vararg is not None
+    accepts_ctx = (
+        any(argument.arg == "ctx" for argument in arguments.args)
+        or any(argument.arg == "ctx" for argument in arguments.kwonlyargs)
+        or arguments.kwarg is not None
+    )
+    if not accepts_event_context or not accepts_ctx:
+        return None
     for statement in tree.body:
         if isinstance(statement, ast.Assign):
             targets = statement.targets
