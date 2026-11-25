@@ -46,7 +46,10 @@ def _prepare_request(args, api) -> dict[str, Any] | None:
         if json_output:
             _emit_json({"schema_version": 1, "connected": False, "code": "probe_not_configured"})
         else:
-            api._error("Curator status probe requires the opted-in local stdio curator_v2 server")
+            api._error(
+                "Curator status probe requires the opted-in local stdio server "
+                "and a valid project binding"
+            )
         return None
     request = {"name": name, "cfg": cfg, "json_output": json_output,
                "curator_probe": curator_probe}
@@ -58,8 +61,22 @@ def _prepare_request(args, api) -> dict[str, Any] | None:
 
 def _curator_probe_configured(name: str, cfg: dict) -> bool:
     command = cfg.get("command")
-    return (name == "curator_v2" and cfg.get("hermes_context") is True
-            and isinstance(command, str) and bool(command.strip()) and not cfg.get("url"))
+    project_id = cfg.get("hermes_project_id")
+    valid_project_id = (
+        isinstance(project_id, str)
+        and project_id.isascii()
+        and 1 <= len(project_id) <= 128
+        and all(char.isalnum() or char in "._-" for char in project_id)
+    )
+    project_binding_configured = name == "curator_v2" or valid_project_id
+    return (
+        bool(name)
+        and cfg.get("hermes_context") is True
+        and project_binding_configured
+        and isinstance(command, str)
+        and bool(command.strip())
+        and not cfg.get("url")
+    )
 
 
 def _show_transport(name: str, cfg: dict, api) -> None:

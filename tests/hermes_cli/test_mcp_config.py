@@ -282,6 +282,40 @@ class TestMcpAdd:
 class TestMcpTest:
 
 
+    def test_curator_status_probe_accepts_project_bound_server_alias(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        _seed_config(tmp_path, {
+            "curatormd_v2": {
+                "command": "/usr/local/bin/curatormd-v2-mcp",
+                "hermes_context": True,
+                "hermes_project_id": "gptmd",
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        def probe(name, config, **kwargs):
+            assert name == "curatormd_v2"
+            assert config["hermes_project_id"] == "gptmd"
+            kwargs["probe_result"].update({
+                "is_error": False,
+                "health_snapshot": {
+                    "project_id": "gptmd",
+                    "status": "healthy",
+                    "gate_codes": [],
+                },
+            })
+            return [("project_health", "Bounded readiness summary")]
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", probe)
+        args = _make_args(name="curatormd_v2")
+        args.probe_curator_status = True
+        args.json_output = True
+
+        assert cmd_mcp_test(args) == 0
+        assert '"project_id":"gptmd"' in capsys.readouterr().out
+
+
     def test_curator_status_probe_requires_local_hermes_context(self, tmp_path, capsys, monkeypatch):
         _seed_config(tmp_path, {
             "curator_v2": {"command": "/usr/local/bin/curatormd-v2-mcp"},
@@ -891,19 +925,19 @@ class TestCuratorStatusProbe:
                 return None
 
         async def _connect_server(name, config):
-            assert name == "curator_v2"
+            assert name == "curatormd_v2"
             return _Server()
 
         monkeypatch.setattr("tools.mcp_tool_discovery._connect_server", _connect_server)
         monkeypatch.setattr(
             "tools.mcp_tool_handlers._trusted_hermes_request_meta",
             lambda name, kwargs: metadata
-            if name == "curator_v2" and kwargs["session_id"] == "curator-status-probe-test"
+            if name == "curatormd_v2" and kwargs["session_id"] == "curator-status-probe-test"
             else None,
         )
         result = {}
         mc._probe_single_server(
-            "curator_v2",
+            "curatormd_v2",
             {
                 "command": "curatormd-v2-mcp",
                 "hermes_context": True,
@@ -958,7 +992,7 @@ class TestCuratorStatusProbe:
         assert "private" not in repr(result)
         with pytest.raises(RuntimeError, match="configured Hermes project"):
             mc._probe_single_server(
-                "curator_v2",
+                "curatormd_v2",
                 {
                     "command": "curatormd-v2-mcp",
                     "hermes_context": True,

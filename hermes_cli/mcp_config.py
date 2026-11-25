@@ -438,6 +438,7 @@ async def _probe_curator_ledger(
     server: Any,
     tools_found: list[tuple[str, str]],
     session_id: str,
+    server_name: str,
     expected_project_id: str,
 ) -> dict[str, Any]:
     """Read bounded activity, goal, and health summaries using Hermes context."""
@@ -449,7 +450,7 @@ async def _probe_curator_ledger(
         raise RuntimeError("Configured Curator V2 status tools are unavailable")
     from tools.mcp_tool_handlers import _trusted_hermes_request_meta
 
-    metadata = _trusted_hermes_request_meta("curator_v2", {"session_id": session_id})
+    metadata = _trusted_hermes_request_meta(server_name, {"session_id": session_id})
     if metadata is None:
         raise RuntimeError("Curator V2 trusted Hermes context is unavailable")
     status_error, status_text = await _curator_probe_call(
@@ -612,13 +613,12 @@ def _probe_single_server(
             if curator_status_probe:
                 if probe_session_id is None or probe_result is None:
                     raise RuntimeError("Curator V2 status probe context is unavailable")
-                if name != "curator_v2":
-                    raise RuntimeError("Curator V2 status probe requires curator_v2")
                 probe_result.update(
                     await _probe_curator_ledger(
                         server,
                         tools_found,
                         probe_session_id,
+                        name,
                         config.get("hermes_project_id"),
                     )
                 )
