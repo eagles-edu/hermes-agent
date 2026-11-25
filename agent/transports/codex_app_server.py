@@ -90,7 +90,7 @@ def _hermes_context_mcp_overrides(
     """Scope opted-in Hermes MCP servers to the active profile and session."""
     home = Path(codex_home or os.getenv("CODEX_HOME", "").strip() or Path.home() / ".codex")
     try:
-        config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+        config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8-sig"))
     except (OSError, tomllib.TOMLDecodeError):
         return []
     servers = config.get("mcp_servers")

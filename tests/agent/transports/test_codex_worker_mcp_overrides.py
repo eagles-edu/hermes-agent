@@ -118,3 +118,26 @@ def test_hermes_context_servers_are_enabled_only_for_the_active_profile(tmp_path
     assert _hermes_context_mcp_overrides(str(codex_home), {}) == [
         "-c", "mcp_servers.curatormd_v2.enabled=false",
     ]
+
+
+def test_hermes_context_mcp_config_accepts_utf8_bom(tmp_path):
+    from agent.transports.codex_app_server import _hermes_context_mcp_overrides
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config = (
+        '[mcp_servers.curatormd_v2]\n'
+        'command = "uv"\n'
+        'env = { HERMES_CODEX_APP_SERVER_CONTEXT = "1" }\n'
+    )
+    (codex_home / "config.toml").write_text("\ufeff" + config, encoding="utf-8")
+
+    overrides = _hermes_context_mcp_overrides(
+        str(codex_home), {"curatormd_v2": {"profile_id": "gptmd-coding", "session_id": "session-123"}}
+    )
+
+    assert overrides == [
+        "-c", "mcp_servers.curatormd_v2.enabled=true",
+        "-c", 'mcp_servers.curatormd_v2.env.HERMES_CONTEXT_PROFILE_ID="gptmd-coding"',
+        "-c", 'mcp_servers.curatormd_v2.env.HERMES_CONTEXT_SESSION_ID="session-123"',
+    ]

@@ -133,6 +133,39 @@ class TestCodexAppServerModule:
             }
         }
 
+    def test_profile_context_readiness_degrades_on_expected_probe_errors(self, monkeypatch, tmp_path, caplog) -> None:
+        from agent.codex_runtime import _codex_mcp_server_contexts
+
+        private_path = str(tmp_path / "private" / "gptmd.sqlite3")
+
+        def fail_readiness(*args, **kwargs):
+            raise OSError(f"cannot read {private_path}")
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-home"))
+        monkeypatch.setattr("tools.curator_v2_health.curator_v2_readiness", fail_readiness)
+        contexts = _codex_mcp_server_contexts(
+            {
+                "mcp_servers": {
+                    "curatormd_v2": {
+                        "command": "uv",
+                        "hermes_context": True,
+                        "hermes_project_id": "gptmd",
+                        "codex_app_server_context": True,
+                    }
+                }
+            },
+            "session-1",
+            "gptmd-coding",
+        )
+
+        assert contexts == {
+            "curatormd_v2": {
+                "profile_id": "gptmd-coding",
+                "session_id": "session-1",
+            }
+        }
+        assert private_path not in caplog.text
+
 
 
 class TestCodexAppServerClose:

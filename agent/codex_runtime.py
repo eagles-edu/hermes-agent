@@ -772,7 +772,7 @@ def _codex_mcp_server_contexts(
                 home=get_hermes_home(),
             )
             context["readiness_json"] = json.dumps(readiness, separators=(",", ":"))
-        except Exception as exc:
+        except (ImportError, OSError, TypeError, ValueError) as exc:
             logger.warning(
                 "codex app-server MCP readiness context unavailable for %s (%s)",
                 name, type(exc).__name__,
