@@ -237,6 +237,9 @@ class TestTrustGateAtCallTime:
             "hermes_cli.mcp_config._get_mcp_servers", return_value=mcp_config
         ), patch("hermes_constants.get_hermes_home", return_value=home), patch(
             "hermes_constants.profile_name_for_home", return_value="renew-ssl-coding"
+        ), patch(
+            "tools.curator_v2_health.curator_v2_readiness",
+            return_value={"event_router": {"ready": True}},
         ):
             result = HookContext("curator").call_mcp(
                 "srv",
@@ -257,6 +260,7 @@ class TestTrustGateAtCallTime:
             meta={
                 "hermes/profile_id": "renew-ssl-coding",
                 "hermes/session_id": "host-session-1",
+                "hermes/readiness": {"event_router": {"ready": True}},
             },
         )
 
@@ -339,6 +343,42 @@ class TestTrustGateAtCallTime:
         ):
             with pytest.raises(RuntimeError, match="profile or session context is unavailable"):
                 _trusted_hermes_request_meta("srv", {"session_id": "session-17"})
+
+    def test_hermes_project_readiness_is_not_tied_to_a_server_alias(self):
+        """Configured local Curator profiles receive their bound readiness under any alias."""
+        from tools.mcp_tool_handlers import _trusted_hermes_request_meta
+
+        readiness = {"human_review": {"ready": False, "observed_at": "2026-11-25T00:00:00Z"}}
+        config = {
+            "command": "uv",
+            "hermes_context": True,
+            "hermes_project_id": "gptmd",
+        }
+        with patch(
+            "hermes_cli.mcp_config._get_mcp_servers",
+            return_value={"curatormd_v2": config},
+        ), patch(
+            "hermes_constants.get_hermes_home", return_value="/profiles/gptmd-coding"
+        ), patch(
+            "hermes_constants.profile_name_for_home", return_value="gptmd-coding"
+        ), patch(
+            "tools.curator_v2_health.curator_v2_readiness", return_value=readiness
+        ) as probe:
+            metadata = _trusted_hermes_request_meta(
+                "curatormd_v2", {"session_id": "session-17"}
+            )
+
+        assert metadata == {
+            "hermes/profile_id": "gptmd-coding",
+            "hermes/session_id": "session-17",
+            "hermes/readiness": readiness,
+        }
+        probe.assert_called_once_with(
+            config,
+            profile_id="gptmd-coding",
+            session_id="session-17",
+            home="/profiles/gptmd-coding",
+        )
 
     def test_denied_approval_blocks_rpc(self, fake_session):
         """'decline' blocks the call — the RPC must never fire."""

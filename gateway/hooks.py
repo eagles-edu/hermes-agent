@@ -431,3 +431,9 @@ class ProfileHookRegistries:
 
     async def emit_collect(self, event_type: str, context: Optional[dict[str, Any]] = None) -> list[Any]:
         return await self._active().emit_collect(event_type, context)
+
+    def record_agent_usage(
+        self, session_id: Any, turn_id: Any, groups: Any,
+    ) -> int:
+        """Record usage through the registry for the currently routed profile."""
+        return self._active().record_agent_usage(session_id, turn_id, groups)

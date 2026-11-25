@@ -120,6 +120,21 @@ class TestDiscoverAndLoad:
 
 class TestEmit:
 
+    def test_profile_hook_registries_delegate_usage_to_active_profile(self):
+        from gateway.hooks import ProfileHookRegistries
+
+        class Registry:
+            def record_agent_usage(self, session_id, turn_id, groups):
+                return (session_id, turn_id, groups)
+
+        registries = ProfileHookRegistries()
+        registry = Registry()
+        registries._active = lambda: registry
+
+        assert registries.record_agent_usage("session", "turn", [{"model": "m"}]) == (
+            "session", "turn", [{"model": "m"}]
+        )
+
     def test_new_session_starts_fresh_sequence_and_old_session_keeps_old_source(self, tmp_path):
         from gateway.codex_outbox import CodexLifecycleOutbox
 

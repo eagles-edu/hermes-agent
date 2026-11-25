@@ -95,7 +95,7 @@ def _trusted_hermes_request_meta(
     )
     if authenticated_subject is not None:
         metadata["hermes/authenticated_subject"] = authenticated_subject
-    if server_name == "curator_v2" and config.get("hermes_project_id"):
+    if config.get("hermes_project_id"):
         from tools.curator_v2_health import curator_v2_readiness
 
         metadata["hermes/readiness"] = curator_v2_readiness(
