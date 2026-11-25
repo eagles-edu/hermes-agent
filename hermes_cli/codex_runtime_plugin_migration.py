@@ -71,7 +71,8 @@ class MigrationReport:
 _KNOWN_HERMES_KEYS = {
     "command", "args", "env", "cwd",
     "url", "headers", "transport",
-    "timeout", "connect_timeout",
+    "timeout", "connect_timeout", "hermes_context", "hermes_project_id",
+    "codex_app_server_context",
     "enabled", "description"}
 _KEYS_DROPPED_WITH_WARNING = {"sampling"}
 
@@ -116,6 +117,19 @@ def _translate_one_server(name: str, hermes_cfg: dict) -> tuple[Optional[dict], 
             skipped.append("transport=sse (codex auto-negotiates)")
     else:
         return None, ["no command or url field"]
+    if hermes_cfg.get("codex_app_server_context") is True:
+        if (
+            name == "curatormd_v2"
+            and hermes_cfg.get("hermes_context") is True
+            and hermes_cfg.get("command")
+            and not hermes_cfg.get("url")
+        ):
+            out.setdefault("env", {})["HERMES_CODEX_APP_SERVER_CONTEXT"] = "1"
+            out["args"] = [*out.get("args", []), "--allow-codex-app-server-context"]
+        else:
+            skipped.append(
+                "codex_app_server_context (requires hermes_context on a local Curator V2 stdio server)"
+            )
     for hermes_key, codex_key, note in _TIMEOUT_KEYS:
         if hermes_key in hermes_cfg:
             try:

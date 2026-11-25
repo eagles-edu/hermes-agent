@@ -689,6 +689,7 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
     from hermes_cli.codex_runtime_switch import get_configured_codex_binary
     from hermes_cli.config import load_config
+    from hermes_constants import get_hermes_home, profile_name_for_home
     # Approval callback: Hermes' standard prompt flow when a CLI thread installed one. `hermes chat -q`, cron and
     # unattended platforms can have one registered with nobody to answer it, so they get none and fail closed at once.
     approval_callback = None
@@ -722,15 +723,62 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
     history_seed = render_history_seed(messages) or None
     # The model always rides along: codex's home is shared, while the Hermes model is per profile/session,
     # so omitting it ran codex's own default instead of the selection.
+    hermes_config = load_config()
+    mcp_server_contexts = _codex_mcp_server_contexts(
+        hermes_config, str(getattr(agent, "session_id", "") or ""),
+        profile_name_for_home(get_hermes_home()),
+    )
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
-        codex_bin=get_configured_codex_binary(load_config()),
+        codex_bin=get_configured_codex_binary(hermes_config),
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
         developer_instructions=developer_instructions or None,
         model=_codex_wire_model(agent, model_provider), model_provider=model_provider,
         resume_thread_id=resume_thread_id, history_seed=history_seed,
+        mcp_server_contexts=mcp_server_contexts,
     )
+
+
+def _codex_mcp_server_contexts(
+    config: dict[str, Any], session_id: str, profile_id: str | None,
+) -> dict[str, dict[str, str]]:
+    """Build host-owned app-server context for the opted-in Curator MCP server."""
+    if not profile_id or not session_id:
+        return {}
+    from hermes_constants import get_hermes_home
+
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return {}
+    contexts: dict[str, dict[str, str]] = {}
+    for name, server in servers.items():
+        if (
+            str(name) != "curatormd_v2"
+            or not isinstance(server, dict)
+            or server.get("codex_app_server_context") is not True
+        ):
+            continue
+        if server.get("hermes_context") is not True or not server.get("hermes_project_id"):
+            continue
+        if not isinstance(server.get("command"), str) or server.get("url"):
+            continue
+        context = {"profile_id": profile_id, "session_id": session_id}
+        try:
+            from tools.curator_v2_health import curator_v2_readiness
+
+            readiness = curator_v2_readiness(
+                server, profile_id=profile_id, session_id=session_id,
+                home=get_hermes_home(),
+            )
+            context["readiness_json"] = json.dumps(readiness, separators=(",", ":"))
+        except Exception as exc:
+            logger.warning(
+                "codex app-server MCP readiness context unavailable for %s (%s)",
+                name, type(exc).__name__,
+            )
+        contexts[str(name)] = context
+    return contexts
 
 
 def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> bool:

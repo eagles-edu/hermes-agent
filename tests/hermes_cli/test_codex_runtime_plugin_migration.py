@@ -32,6 +32,29 @@ class TestTranslateOneServer:
         }
         assert skipped == []
 
+    def test_codex_app_server_context_is_explicit_and_local_only(self):
+        cfg, skipped = _translate_one_server("curatormd_v2", {
+            "command": "uv",
+            "args": ["run", "curatormd-v2-mcp"],
+            "hermes_context": True,
+            "hermes_project_id": "gptmd",
+            "codex_app_server_context": True,
+        })
+        assert cfg is not None
+        assert cfg["env"]["HERMES_CODEX_APP_SERVER_CONTEXT"] == "1"
+        assert cfg["args"][-1] == "--allow-codex-app-server-context"
+        assert skipped == []
+
+    def test_codex_app_server_context_rejects_remote_servers(self):
+        cfg, skipped = _translate_one_server("curatormd_v2", {
+            "url": "https://example.test/mcp",
+            "codex_app_server_context": True,
+        })
+        assert cfg is not None
+        assert cfg["url"] == "https://example.test/mcp"
+        assert not cfg.get("env")
+        assert any("requires hermes_context" in item for item in skipped)
+
 
 
 

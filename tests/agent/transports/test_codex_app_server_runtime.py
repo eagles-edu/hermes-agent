@@ -95,6 +95,44 @@ class TestCodexAppServerModule:
         assert ok is False
         assert msg
 
+    def test_profile_context_mcp_servers_get_session_scoped_readiness(self, monkeypatch, tmp_path) -> None:
+        from agent.codex_runtime import _codex_mcp_server_contexts
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-home"))
+        monkeypatch.setattr(
+            "tools.curator_v2_health.curator_v2_readiness",
+            lambda config, *, profile_id, session_id, home: {
+                "human_review": {"ready": True},
+            },
+        )
+        contexts = _codex_mcp_server_contexts(
+            {
+                "mcp_servers": {
+                    "curatormd_v2": {
+                        "command": "uv",
+                        "hermes_context": True,
+                        "hermes_project_id": "gptmd",
+                        "codex_app_server_context": True,
+                    },
+                    "remote": {
+                        "url": "https://example.test/mcp",
+                        "hermes_context": True,
+                        "hermes_project_id": "ignored",
+                        "codex_app_server_context": True,
+                    },
+                }
+            },
+            "session-1",
+            "gptmd-coding",
+        )
+        assert contexts == {
+            "curatormd_v2": {
+                "profile_id": "gptmd-coding",
+                "session_id": "session-1",
+                "readiness_json": '{"human_review":{"ready":true}}',
+            }
+        }
+
 
 
 class TestCodexAppServerClose:

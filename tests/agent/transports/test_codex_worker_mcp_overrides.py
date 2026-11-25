@@ -7,6 +7,7 @@ codex then saw an env-only entry with no transport and refused to start.
 
 import subprocess
 import tomllib
+import json
 
 import pytest
 
@@ -85,3 +86,35 @@ def test_only_dispatcher_owned_workers_get_mcp_overrides(launch):
     assert launch({}) == []
     with non_dispatcher_owned_context():
         assert launch({"HERMES_KANBAN_TASK": "11111111-1111-4111-8111-111111111111"}) == []
+
+
+def test_hermes_context_servers_are_enabled_only_for_the_active_profile(tmp_path):
+    from agent.transports.codex_app_server import _hermes_context_mcp_overrides
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.curatormd_v2]\n'
+        'command = "uv"\n'
+        'args = ["run"]\n'
+        'env = { HERMES_CODEX_APP_SERVER_CONTEXT = "1" }\n',
+        encoding="utf-8",
+    )
+    context = {
+        "curatormd_v2": {
+            "profile_id": "gptmd-coding",
+            "session_id": "session-123",
+            "readiness_json": '{"human_review":{"ready":true}}',
+        }
+    }
+    overrides = _hermes_context_mcp_overrides(str(codex_home), context)
+    settings = [overrides[index + 1] for index, value in enumerate(overrides[:-1]) if value == "-c"]
+    assert settings[:3] == [
+        "mcp_servers.curatormd_v2.enabled=true",
+        'mcp_servers.curatormd_v2.env.HERMES_CONTEXT_PROFILE_ID="gptmd-coding"',
+        'mcp_servers.curatormd_v2.env.HERMES_CONTEXT_SESSION_ID="session-123"',
+    ]
+    assert json.loads(settings[3].split("=", 1)[1]) == context["curatormd_v2"]["readiness_json"]
+    assert _hermes_context_mcp_overrides(str(codex_home), {}) == [
+        "-c", "mcp_servers.curatormd_v2.enabled=false",
+    ]

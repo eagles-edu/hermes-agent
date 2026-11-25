@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import queue
 import re
 import subprocess
 import threading
+import tomllib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.deadline import kill_process_tree
@@ -22,6 +25,7 @@ from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAM
 from tools.environments.local import hermes_subprocess_env
 
 MIN_CODEX_VERSION = (0, 125, 0)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,6 +84,51 @@ def _reap_snapshotted(descendants: list[Any]) -> None:
             child.kill()
 
 
+def _hermes_context_mcp_overrides(
+    codex_home: Optional[str], contexts: dict[str, dict[str, str]],
+) -> list[str]:
+    """Scope opted-in Hermes MCP servers to the active profile and session."""
+    home = Path(codex_home or os.getenv("CODEX_HOME", "").strip() or Path.home() / ".codex")
+    try:
+        config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return []
+    marked = {
+        str(name): entry
+        for name, entry in servers.items()
+        if isinstance(entry, dict)
+        and isinstance(entry.get("env"), dict)
+        and entry["env"].get("HERMES_CODEX_APP_SERVER_CONTEXT") == "1"
+    }
+    overrides: list[str] = []
+    for name in marked:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            logger.warning("skipping Hermes context MCP server with unsupported name %r", name)
+            continue
+        context = contexts.get(name)
+        if not isinstance(context, dict):
+            overrides += ["-c", f"mcp_servers.{name}.enabled=false"]
+            continue
+        if not all(isinstance(context.get(key), str) and context[key] for key in ("profile_id", "session_id")):
+            logger.warning("skipping Hermes context MCP server %s with incomplete profile context", name)
+            overrides += ["-c", f"mcp_servers.{name}.enabled=false"]
+            continue
+        overrides += ["-c", f"mcp_servers.{name}.enabled=true"]
+        values = {
+            "HERMES_CONTEXT_PROFILE_ID": context["profile_id"],
+            "HERMES_CONTEXT_SESSION_ID": context["session_id"],
+        }
+        readiness = context.get("readiness_json")
+        if isinstance(readiness, str) and readiness:
+            values["HERMES_CONTEXT_READINESS_JSON"] = readiness
+        for key, value in values.items():
+            overrides += ["-c", f"mcp_servers.{name}.env.{key}={json.dumps(value)}"]
+    return overrides
+
+
 class CodexAppServerClient:
     """Minimal synchronous JSON-RPC 2.0 client for ``codex app-server`` over stdio.
 
@@ -91,6 +140,7 @@ class CodexAppServerClient:
     def __init__(
         self, codex_bin: str = "codex", codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None, env: Optional[dict[str, str]] = None,
+        mcp_server_contexts: Optional[dict[str, dict[str, str]]] = None,
     ) -> None:
         self._codex_bin = codex_bin
         # codex needs LLM provider creds but must not receive Tier-1 Hermes secrets (gateway/GitHub/infra tokens).
@@ -109,6 +159,7 @@ class CodexAppServerClient:
             spawn_env["CODEX_HOME"] = codex_home
 
         cmd = [codex_bin, "app-server", *(extra_args or [])]
+        cmd += _hermes_context_mcp_overrides(codex_home, mcp_server_contexts or {})
         from agent.delegation_context import (
             DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
             delegated_child_subprocess_env, is_dispatcher_owned_worker_context,
